@@ -1977,6 +1977,131 @@ If a model rejects the API you send, AWS says so precisely:
 
 **Unresolved:** switching Claude to `apiFormat: messages` with `path: /v1/messages` produced a 404 from AWS. The correct Mantle path for Anthropic-native format was not determined. **Use an OpenAI-family model for the demo** — `openai.gpt-oss-20b` is verified working end to end.
 
+## 4.5d Adding another Bedrock model
+
+Repeatable procedure, verified. Bedrock Mantle exposes 50+ models through the one ABSK credential and the one `ExternalProvider` — adding a model is five resources, no new AWS anything.
+
+### Step 1 — Assess candidates BEFORE registering
+
+Test against Bedrock directly. This bypasses RHOAI entirely, so a failure here is AWS's and you have not touched the cluster.
+
+```bash
+# Everything available in your region
+curl -s "https://bedrock-mantle.${AWS_REGION}.api.aws/v1/models" \
+  -H "Authorization: Bearer ${BEDROCK_API_KEY}" \
+  | jq -r '.data[] | select(.status=="available") | .id' | sort
+```
+
+Then benchmark the shortlist — status, token cost, and whether `content` is actually populated:
+
+```bash
+for m in openai.gpt-oss-120b mistral.mistral-large-3-675b-instruct qwen.qwen3-32b \
+         google.gemma-3-27b-it deepseek.v3.2 nvidia.nemotron-nano-9b-v2; do
+  printf "%-42s " "$m"
+  code=$(curl -s -o /tmp/r.json -w "%{http_code}" -m 60 \
+    "https://bedrock-mantle.${AWS_REGION}.api.aws/v1/chat/completions" \
+    -H "Authorization: Bearer ${BEDROCK_API_KEY}" -H "Content-Type: application/json" \
+    -d "{\"model\":\"$m\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in 3 words.\"}],\"max_tokens\":300}")
+  echo -n "$code  "
+  jq -r 'if .choices then "\(.usage.total_tokens) tok | \(.choices[0].message.content // "NULL — reasoning only")" else .error.message end' /tmp/r.json
+done
+```
+
+Reference results, same prompt:
+
+| Model | Tokens | Verdict |
+|---|---|---|
+| `mistral.mistral-large-3-675b-instruct` | **15** | Best — direct answer, different vendor |
+| `deepseek.v3.2` | 17 | Clean |
+| `qwen.qwen3-32b` | 26 | Clean |
+| `google.gemma-3-27b-it` | 32 | Clean, but emoji and an aside |
+| `openai.gpt-oss-120b` | 170 | Reasoning tokens |
+| `nvidia.nemotron-nano-9b-v2` | 319 | Reasoning tokens leaked into `content` — avoid |
+| `anthropic.claude-*` | — | **400: does not support `/v1/chat/completions`** |
+
+**What to look for:**
+
+- **Token count for a trivial prompt.** Reasoning models spend hundreds before answering. `gpt-oss-20b` used 214 tokens on a three-word greeting; mistral used 15. Those tokens are billed and metered, so a reasoning model muddies any cost or quota story.
+- **`content` is not null.** Reasoning models return `finish_reason: "length"` with `content: null` when `max_tokens` is too low — looks broken, isn't. Test at 300.
+- **Reasoning leaking into `content`.** Nemotron returned its entire monologue as the answer. Fine for a chatbot, terrible in a demo.
+- **Vendor diversity.** For the §6.2 model-swap moment, a different vendor makes the portability point far better than another model from the same family.
+- **Anthropic models reject `openai-chat`** on Mantle and the Messages path is unresolved (Appendix G §4).
+
+### Step 2 — Register it
+
+```bash
+export M2_NAME="mistral-large"                              # client-facing name
+export M2_TARGET="mistral.mistral-large-3-675b-instruct"    # Bedrock model id
+
+cat <<EOF | oc apply -f -
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalModel
+metadata:
+  name: ${M2_NAME}
+  namespace: ${MODEL_NS}
+spec:
+  modelName: ${M2_NAME}
+  externalProviderRefs:
+    - ref:
+        name: bedrock-${AWS_REGION}      # the existing provider — no new credential
+      apiFormat: openai-chat
+      path: /v1/chat/completions
+      targetModel: ${M2_TARGET}
+      weight: 100
+---
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSModelRef
+metadata:
+  name: ${M2_NAME}
+  namespace: ${MODEL_NS}
+spec:
+  modelRef:
+    kind: ExternalModel
+    name: ${M2_NAME}
+EOF
+```
+
+### Step 3 — Governance (or it stays Pending)
+
+A model with no `MaaSAuthPolicy` **and** `MaaSSubscription` referencing it never becomes Ready (§4.5).
+
+```bash
+oc patch maasauthpolicy bedrock-access -n models-as-a-service --type=json \
+  -p "[{\"op\":\"add\",\"path\":\"/spec/modelRefs/-\",\"value\":{\"name\":\"${M2_NAME}\",\"namespace\":\"${MODEL_NS}\"}}]"
+
+oc patch maassubscription analysts-standard -n models-as-a-service --type=json \
+  -p "[{\"op\":\"add\",\"path\":\"/spec/modelRefs/-\",\"value\":{\"name\":\"${M2_NAME}\",\"namespace\":\"${MODEL_NS}\",\"tokenRateLimits\":[{\"limit\":100000,\"window\":\"1h\"}]}}]"
+```
+
+### Step 4 — Patch the HTTPRoute (§4.5b bug)
+
+Every new model needs this. Wait for the route to exist first.
+
+```bash
+sleep 20
+oc patch httproute ${M2_NAME} -n ${MODEL_NS} --type=json \
+  -p "[{\"op\":\"replace\",\"path\":\"/spec/rules/3/matches/0/headers/0/value\",\"value\":\"${M2_NAME}\"}]"
+```
+
+### Step 5 — Verify
+
+```bash
+oc get maasmodelref -n ${MODEL_NS}        # PHASE Ready, ENDPOINT populated
+
+curl -sk -m 60 "${MAAS_GW}/v1/chat/completions" \
+  -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" \
+  -d "{\"model\":\"${M2_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in 3 words.\"}],\"max_tokens\":300}" \
+  | jq '{content: .choices[0].message.content, tokens: .usage.total_tokens}'
+```
+
+Reference: `{"content": "\"Hey there, friend!\"", "tokens": 17}` — Ready in 49s from apply to working call.
+
+### The customer point
+
+Adding a model touched **no AWS resource, no new credential, no client change**. Same `ExternalProvider`, same ABSK key, same analyst API key. Two CRs and two patches, and every analyst on that subscription can use it immediately by changing one string.
+
+Note the cost contrast for §6.3: the same prompt costs **214 tokens on `gpt-oss-20b` and 15 on `mistral-large`** — 14×. That is a live argument for per-model metering, and it lands better than a slide.
+
 ## 4.6 Access policy and quota
 
 These live in **`models-as-a-service`**, not the model namespace. Two tiers, so §6.3 can exhaust one on camera.
@@ -2486,188 +2611,249 @@ Demo it: the analyst's key against the direct MaaS URL now returns **403**, and 
 
 ---
 
-# PART 6 — Verification and the demo
+# PART 6 — The demo
 
-Run this end to end before showing anyone. Each check maps to a customer objection.
+Written against the **verified working state**. Every command here was run successfully on the reference cluster. Where something is not yet working, it says so.
 
-## 6.1 Platform health
+---
 
-```bash
-oc get gateway -n openshift-ingress                          # PROGRAMMED=True
-oc get pods -n kuadrant-system                               # authorino, limitador Running
-oc get pods -n openshift-ingress -l app=payload-processing   # 1/1 Running
-oc get externalmodel,maasmodelref -n ${MODEL_NS}             # PHASE Ready
-oc get maasauthpolicy,maassubscription -n models-as-a-service
-oc get guardrailsorchestrator -n ${GR_NS}
-curl -sk "${MAAS_GW}/maas-api/health"
-```
+## 6.0 Pre-flight — 10 minutes before
 
-## 6.2 Demo 1 — Workbench
-
-This is the strongest opener: it looks exactly like what the analysts already do.
-
-**Use the workbench created in §2.7.** If you skipped that smoke test, create it now: RHOAI dashboard → **Projects** → **Create project** (`bedrock-demo`) → open it → **Workbenches → Create workbench**. Image `Jupyter | Data Science | CPU | Python 3.12`, hardware profile `default-profile`, 20 GiB storage. (3.5 renamed the nav item, the images, and replaced container sizes with hardware profiles.)
+Do not skip. Two of these have bitten during this build.
 
 ```bash
-oc get pods -n bedrock-demo    # notebook pod Running
-```
+# 1. Environment
+export CLUSTER_DOMAIN=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')
+export MAAS_GW="https://maas.${CLUSTER_DOMAIN}"
+export MODEL_NS="external-models"
+export MODEL="bedrock-gpt-oss-20b"
+export MODEL2="mistral-large"        # cross-vendor swap for §6.2
+echo "$MAAS_GW"
 
-**Mint a key for the notebook:**
+# 2. Health
+curl -sk "${MAAS_GW}/maas-api/health"; echo     # {"status":"healthy"}
 
-```bash
-curl -sk -X POST "${MAAS_GW}/maas-api/v1/api-keys" \
+# 3. The HTTPRoute patch survived (§4.5b) — re-apply if not
+for m in ${MODEL} ${MODEL2}; do
+  printf "%-24s " "$m"
+  oc get httproute $m -n ${MODEL_NS} \
+    -o jsonpath='{.spec.rules[3].matches[0].headers[0].value}'; echo   # must equal $m
+done
+
+# 4. Credential is in the IPP store
+oc get secret bedrock-api-key -n ${MODEL_NS} \
+  -o jsonpath='{.metadata.labels}'; echo        # inference.llm-d.ai/ipp-managed: "true"
+
+# 5. Fresh API key (they expire — mint a new one for the demo)
+API_KEY=$(curl -sk -X POST "${MAAS_GW}/maas-api/v1/api-keys" \
   -H "Authorization: Bearer $(oc whoami -t)" -H "Content-Type: application/json" \
-  -d '{"name":"workbench-demo","subscription":"analysts-standard","expiresIn":"24h"}' | jq -r '.key'
-```
+  -d '{"name":"demo","subscription":"analysts-standard","expiresIn":"24h"}' | jq -r '.key')
+echo "${API_KEY:0:12}..."
 
-**In the notebook:**
-
-```python
-!pip install openai --quiet
-
-from openai import OpenAI
-
-MAAS_GW = "https://maas.<cluster-domain>"
-API_KEY = "<paste the MaaS key>"
-
-client = OpenAI(
-    base_url=f"{MAAS_GW}/external-models/bedrock-claude-sonnet/v1",
-    api_key=API_KEY,
-)
-
-resp = client.chat.completions.create(
-    model="bedrock-claude-sonnet",
-    messages=[{"role": "user", "content": "Summarise the risks of long-lived API keys in three bullets."}],
-    max_tokens=300,
-)
-print(resp.choices[0].message.content)
-print("tokens:", resp.usage.total_tokens)
-```
-
-**The point to make out loud:** this is the standard OpenAI SDK, unmodified. Two lines changed — `base_url` and `api_key`. No AWS SDK, no AWS credential, no boto3, nothing region-specific. And `resp.usage.total_tokens` is now also a line in someone's chargeback report.
-
-**Then swap the model** — change `bedrock-claude-sonnet` to `bedrock-gpt-oss-20b` in both places and re-run. Same code, different provider model, no client redeployment. That is Demo 2's punchline delivered from inside Demo 1.
-
-## 6.3 Demo 2 — Governed access
-
-Run these on camera:
-
-```bash
-# Bogus key → 403. Only org-issued credentials work.
-curl -sk -o /dev/null -w "bogus key:  %{http_code}\n" \
-  "${MAAS_GW}/${MODEL_NS}/bedrock-claude-sonnet/v1/chat/completions" \
-  -H "Authorization: Bearer sk-FAKE" -H "Content-Type: application/json" \
-  -d '{"model":"bedrock-claude-sonnet","messages":[{"role":"user","content":"hi"}],"max_tokens":50}'
-
-# No auth → 401. Nothing is anonymous.
-curl -sk -o /dev/null -w "no auth:    %{http_code}\n" \
-  "${MAAS_GW}/${MODEL_NS}/bedrock-claude-sonnet/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"bedrock-claude-sonnet","messages":[{"role":"user","content":"hi"}],"max_tokens":50}'
-
-# Quota headers — the consumer can see their own budget
-curl -sk -D - -o /dev/null \
-  "${MAAS_GW}/${MODEL_NS}/bedrock-claude-sonnet/v1/chat/completions" \
-  -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" \
-  -d '{"model":"bedrock-claude-sonnet","messages":[{"role":"user","content":"hi"}],"max_tokens":50}' \
-  | grep -i ratelimit
-```
-
-**Exhaust a quota live.** Mint a key on `analysts-trial` (500 tokens/hour) and loop until it 429s:
-
-```bash
-TRIAL=$(curl -sk -X POST "${MAAS_GW}/maas-api/v1/api-keys" \
-  -H "Authorization: Bearer $(oc whoami -t)" -H "Content-Type: application/json" \
-  -d '{"name":"trial","subscription":"analysts-trial","expiresIn":"1h"}' | jq -r '.key')
-
-for i in $(seq 1 10); do
-  code=$(curl -sk -o /dev/null -w "%{http_code}" \
-    "${MAAS_GW}/${MODEL_NS}/bedrock-gpt-oss-20b/v1/chat/completions" \
-    -H "Authorization: Bearer ${TRIAL}" -H "Content-Type: application/json" \
-    -d '{"model":"bedrock-gpt-oss-20b","messages":[{"role":"user","content":"Write a paragraph about clouds."}],"max_tokens":200}')
-  echo "call $i: $code"
+# 6. STABILITY — six clean calls or restart the gateway
+for i in $(seq 1 6); do
+  curl -sk -o /dev/null -w "call $i: %{http_code} in %{time_total}s\n" -m 60 \
+    "${MAAS_GW}/v1/chat/completions" -H "Authorization: Bearer ${API_KEY}" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":300}"
 done
 ```
 
-Watching it flip to 429 is far more persuasive than a slide claiming quotas exist.
-
-**Revoke a key** — the point being that no AWS credential rotates:
+Any 503 → restart the gateway and repeat step 6:
 
 ```bash
-curl -sk "${MAAS_GW}/maas-api/v1/api-keys" -H "Authorization: Bearer $(oc whoami -t)" | jq .
-curl -sk -X DELETE "${MAAS_GW}/maas-api/v1/api-keys/<id>" -H "Authorization: Bearer $(oc whoami -t)"
+oc rollout restart deployment/maas-default-gateway-data-science-gateway-class -n openshift-ingress
+oc rollout status deployment/maas-default-gateway-data-science-gateway-class -n openshift-ingress --timeout=300s
 ```
 
-**Observability:** RHOAI dashboard → **Observability**, showing per-team tokens, request rate, latency, errors.
+Also open ahead of time: the RHOAI dashboard (logged in), the `bedrock-demo` workbench (started — first launch is slow), a terminal with the variables exported, and the AWS console on Bedrock → API keys if you plan to show the "before" state.
+
+**Use `bedrock-gpt-oss-20b`.** `bedrock-claude-sonnet` reports `ready=true` but does not serve — Anthropic models on Bedrock Mantle reject `/v1/chat/completions` and the correct path is unresolved (Appendix G §4). Do not demo it.
+
+---
+
+## 6.1 The setup — 2 minutes, no terminal
+
+Say this before touching anything.
+
+> "Today your analysts hold a Bedrock URL and a long-lived AWS key on their desktops. That works — they're productive. But there's no way to revoke one analyst without rotating the key for everyone, no record of who spent what, no ceiling before the invoice arrives, and that AWS credential sits in a browser tab.
+>
+> What I'll show you is the same models, the same code, the same speed — with the credential moved inside your cluster and every call attributed and capped."
+
+Then the architecture in one breath:
+
+```
+analyst → RHOAI gateway → AWS Bedrock
+             │
+             ├─ validates the analyst's key, strips it
+             ├─ meters tokens against their quota
+             └─ injects the AWS credential from a Secret
+```
+
+**The one-line version:** the analyst's key never reaches AWS, and the AWS key never reaches the analyst.
+
+---
+
+## 6.2 Demo 1 — The analyst experience (Workbench)
+
+Open the workbench in `bedrock-demo`. New notebook.
+
+```python
+!pip install openai --quiet
+```
+
+```python
+from openai import OpenAI
+
+MAAS_GW = "https://maas.apps.<your-domain>"
+API_KEY = "sk-oai-..."          # paste the key from pre-flight
+
+client = OpenAI(base_url=f"{MAAS_GW}/v1", api_key=API_KEY)
+
+resp = client.chat.completions.create(
+    model="bedrock-gpt-oss-20b",
+    messages=[{"role": "user",
+               "content": "Summarise the risks of long-lived API keys in three bullets."}],
+    max_tokens=300,
+)
+print(resp.choices[0].message.content)
+print("\ntokens:", resp.usage.total_tokens)
+```
+
+**Say while it runs:**
+
+> "This is the standard OpenAI SDK, unmodified. Two lines differ from what your analysts run today: the base URL and the key. No AWS SDK, no boto3, no region, no AWS credential anywhere in this notebook."
+
+**Then point at the token count:**
+
+> "That number is now a line in someone's chargeback report. Same call, same result — the difference is that the organisation can see it."
+
+### The model swap
+
+Change one string — `model="bedrock-gpt-oss-20b"` → `model="mistral-large"` — and re-run the same cell.
+
+> "Different vendor's model. Same code, same key, same URL. No new contract, no new credential, no desktop rollout — adding that model was two Kubernetes resources."
+
+**Then point at the token counts side by side:**
+
+| Model | Tokens for the same prompt |
+|---|---|
+| `bedrock-gpt-oss-20b` | 214 |
+| `mistral-large` | 15 |
+
+> "Fourteen times the cost for the same question, because one of them reasons before answering. Neither is wrong — but until now nobody could see it. That's what per-model metering buys you."
+
+Registering more models: §4.5d.
+
+---
+
+## 6.3 Demo 2 — Governed access (terminal)
+
+Four commands. Run them, don't narrate the syntax.
+
+```bash
+# 1. The catalogue — what this analyst may use
+curl -sk "${MAAS_GW}/maas-api/v1/models" -H "Authorization: Bearer $(oc whoami -t)" \
+  | jq -r '.data[] | "\(.id)  ready=\(.ready)  subs=\([.subscriptions[].name]|join(","))"'
+```
+
+> "Two models, each bound to a subscription. Subscriptions are where quota and cost centre live."
+
+```bash
+# 2. A forged key
+curl -sk -o /dev/null -w "forged key:  %{http_code}\n" \
+  "${MAAS_GW}/v1/chat/completions" -H "Authorization: Bearer sk-oai-NOTREAL" \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":50}"
+# 403
+
+# 3. No credential at all
+curl -sk -o /dev/null -w "no auth:     %{http_code}\n" \
+  "${MAAS_GW}/v1/chat/completions" -H "Content-Type: application/json" \
+  -d "{\"model\":\"${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":50}"
+# 401
+```
+
+> "Only credentials this organisation issued will work. Nothing here is anonymous."
+
+```bash
+# 4. A model outside the subscription
+curl -sk -D- -o /dev/null "${MAAS_GW}/v1/chat/completions" \
+  -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" \
+  -d '{"model":"anthropic.claude-sonnet-5","messages":[{"role":"user","content":"hi"}],"max_tokens":50}' \
+  | grep -i 'x-ext-auth-reason'
+# x-ext-auth-reason: model_not_in_subscription
+```
+
+> "This is the part people don't expect. A valid key isn't a licence to use any model — entitlement is per model, per subscription. Whoever owns that budget decides."
+
+### Revocation — the strongest beat
+
+**Console:** **Gen AI studio → API keys**. Show the list, revoke the demo key, then re-run the notebook cell. It fails.
+
+> "That analyst is offboarded. No AWS credential rotated, nobody else disrupted, no ticket to a cloud team. Compare that with today, where revoking one analyst means rotating a key that everyone shares."
+
+Mint a new one and carry on.
+
+### Metering
+
+**Console:** **Settings → MaaS governance** — show the subscriptions, their models, and the token limits.
+
+> "Every call is attributed to a user, a group, and a cost centre. That's the input to chargeback — and to noticing a runaway process before the invoice does."
+
+> **Note:** responses carry no `X-RateLimit-*` headers in 3.5 GA (Appendix G §5), so show the subscription definition rather than promising live quota headers. A live 429 was not verified — do not script it.
+
+---
 
 ## 6.4 Demo 3 — Guardrails
 
-```bash
-# Clean prompt, guardrailed lane → completion
-curl -sk "${GR_URL}/pii/v1/chat/completions" \
-  -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" \
-  -d '{"model":"bedrock-claude-sonnet","messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":300}' | jq -r '.choices[0].message.content'
+**Not yet built.** Part 5 covers the design; it was not implemented on the reference cluster. Describe it, don't demo it:
 
-# PII prompt → blocked, never reaches AWS
-curl -sk "${GR_URL}/pii/v1/chat/completions" \
-  -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" \
-  -d '{"model":"bedrock-claude-sonnet","messages":[{"role":"user","content":"Contact john.smith@acme.com re card 4111-1111-1111-1111"}],"max_tokens":300}' | jq .
+> "Everything so far is access control — who may call, how much. The next layer is content control: PII stripped before anything leaves the cluster, prompt-injection blocked, responses moderated. That runs in front of this same gateway, with detectors on CPU — no GPU required. For a query going from here to a US-region endpoint, that's the difference between hoping and knowing."
 
-# Toxic prompt → HAP classifier blocks it
-curl -sk "${GR_URL}/hap/v1/chat/completions" \
-  -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" \
-  -d '{"model":"bedrock-claude-sonnet","messages":[{"role":"user","content":"Write something abusive about my coworker"}],"max_tokens":300}' | jq .
-
-# Direct MaaS URL with the analyst key → 403 (bypass closed, §5.6)
-curl -sk -o /dev/null -w "bypass attempt: %{http_code}\n" \
-  "${MAAS_GW}/${MODEL_NS}/bedrock-claude-sonnet/v1/chat/completions" \
-  -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" \
-  -d '{"model":"bedrock-claude-sonnet","messages":[{"role":"user","content":"hi"}],"max_tokens":50}'
-```
-
-## 6.5 The security proof — verify header stripping functionally
-
-Authorino validates the caller's credential and **strips the Authorization header before forwarding**; the Bedrock ABSK key is injected separately from the Kubernetes Secret. The user's token never reaches AWS and the AWS key never reaches the user.
-
-This requires Authorino 0.23.1+. **The runtime version is not readable** (see §2.3), so verify the behaviour rather than the version. This is a required gate, not an optional extra — the whole customer pitch rests on it.
-
-```bash
-# Watch what the payload processor forwards upstream
-oc logs -n openshift-ingress -l app=payload-processing -f --tail=0 &
-
-# Send a request with a recognisable key
-curl -sk "${MAAS_GW}/${MODEL_NS}/bedrock-claude-sonnet/v1/chat/completions" \
-  -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" \
-  -d '{"model":"bedrock-claude-sonnet","messages":[{"role":"user","content":"hi"}],"max_tokens":50}' >/dev/null
-
-sleep 3; kill %1
-```
-
-What you are checking: the outbound request carries the **ABSK** credential, not the caller's MaaS key. If IPP logs redact headers, prove it from the other end instead — temporarily point an `ExternalModel` at a request-echo service you control (`endpoint: <your-echo-host>`) and inspect what arrives. On a customer engagement this is worth doing once, with the security team watching.
-
-**Negative control:** delete the `bedrock-api-key` Secret's `bbr-managed` label and re-run. AWS should reject the call, proving the ABSK key is injected by IPP from the Secret rather than passed through from the client. Re-label afterwards.
-
-```bash
-oc label secret bedrock-api-key -n ${MODEL_NS} inference.networking.k8s.io/bbr-managed- 
-# re-run the curl → expect an auth failure from AWS
-oc label secret bedrock-api-key -n ${MODEL_NS} inference.networking.k8s.io/bbr-managed=true --overwrite
-```
-
-## 6.6 Talking points
-
-| Check | What it proves |
-|---|---|
-| 403 on bogus key | Only org-issued credentials work |
-| 401 with no auth | The endpoint is not open |
-| `X-RateLimit-Remaining` | Quota is enforced and visible to the consumer |
-| Live 429 | Spend is capped before the AWS bill, not after |
-| Key revoked, AWS key untouched | Per-analyst offboarding without disruption |
-| Model swapped in the notebook | Provider portability is a CR change, not a desktop rollout |
-| PII blocked | Sensitive data never crosses the region boundary |
-| Bypass returns 403 | Guardrails are mandatory, not advisory |
-| Token metrics per team | Chargeback is real, not aspirational |
+If you have implemented Part 5, run §5.4 and §5.5's tests instead and finish with the bypass attempt returning 403.
 
 ---
+
+## 6.5 Closing — the summary slide
+
+| Today | With RHOAI |
+|---|---|
+| Long-lived AWS key on desktops | Credential lives in the cluster, never leaves |
+| Revoke = rotate for everyone | Revoke one analyst in a click |
+| No attribution | Per-user, per-group, per-cost-centre metering |
+| No ceiling | Quota enforced before the invoice |
+| Model change = desktop rollout | Model change = a Kubernetes resource |
+| Contents unexamined | Guardrails layer available |
+| Analyst effort to migrate | **Two lines: base URL and key** |
+
+---
+
+## 6.6 Be upfront about these
+
+Say them before you're asked. It costs nothing and buys credibility.
+
+| Point | How to put it |
+|---|---|
+| **External model routing is Tech Preview** | "The gateway underneath — auth, metering, quota — is GA. Routing to external providers is Tech Preview. I'd phase accordingly and I'd want that in writing." |
+| **This build needed two undocumented fixes** | "3.5 shipped days ago. We hit two documentation defects and have them filed. Neither affects the architecture, both are one-line workarounds." |
+| **Anthropic via Bedrock is unresolved** | "OpenAI-family models work end to end. Anthropic models on Bedrock's OpenAI-compatible endpoint need a different API path that we haven't pinned down." |
+| **The gateway is now on the critical path** | "Plan HA for the gateway and the rate limiter. If it's down, analysts are down — that's a real change from today." |
+| **The AWS key still needs rotating** | "It's long-lived with an expiry. Someone owns that. Two keys per IAM user makes zero-downtime rotation possible — write that runbook now." |
+
+---
+
+## 6.7 If something fails live
+
+| Symptom | Say | Do |
+|---|---|---|
+| 503, ~60s hang | "One gateway replica is stale — that's the HA story arriving early." | Retry; it round-robins onto the good one |
+| 500 credentials not found | "Credential store lost the Secret." | `oc label secret bedrock-api-key -n ${MODEL_NS} inference.llm-d.ai/ipp-managed=true --overwrite` |
+| 404 | "Routing." | Check the §4.5b HTTPRoute patch |
+| 401 on a real key | "Key expired." | Mint a new one |
+| Slow first response | "Reasoning model — it's thinking before it answers." | Wait; ~1s typical, occasionally longer |
+
+**If it fails hard:** switch to the architecture and the summary table. The story is governance, and the governance layer is provable without a completion — 403 on a forged key and `model_not_in_subscription` both work without touching AWS.
 
 # PART 7 — Troubleshooting
 
@@ -2810,6 +2996,7 @@ aws iam delete-service-specific-credential \
 [ ] Secret bedrock-api-key: key=api-key, label bbr-managed=true, 132 bytes
 [ ] ExternalProvider bedrock-<region> (inference.opendatahub.io) created
 [ ] ExternalModel x2 (claude-sonnet, gpt-oss-20b) with apiFormat/path/targetModel
+[ ] Second working model registered for the swap demo (mistral-large) — §4.5d
 [ ] HTTPRoutes Accepted=True, ResolvedRefs=True, both kuadrant.io/*Affected=True
 [ ] Inference path prefix recorded: /<model-ns>/<model-name>
 [ ] MaaSModelRef x2 created — Pending until §4.6 is applied (expected, not a fault)
