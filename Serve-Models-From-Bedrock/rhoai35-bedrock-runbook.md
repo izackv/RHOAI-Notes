@@ -260,9 +260,16 @@ EOF
 oc wait --for=condition=Ready kuadrant/kuadrant -n kuadrant-system --timeout=180s
 ```
 
-Then enable the TLS listener and point Authorino at the cluster service CA:
+### Authorino TLS — three parts, all required
+
+This is the most error-prone step in Part 2. It has three pieces and **all three must be present**: the server certificate, the CA bundle mount, and the environment variables. Doing only some of them fails silently.
+
+#### (a) Server certificate — enable the TLS listener
+
+The `authorino-server-cert` secret was minted by `service-ca` because you pre-annotated the Service above.
 
 ```bash
+oc explain authorino.spec.listener.tls          # confirm the field path
 oc get secret authorino-server-cert -n kuadrant-system   # must exist
 
 oc patch authorino authorino -n kuadrant-system --type=merge --patch '{
@@ -270,13 +277,101 @@ oc patch authorino authorino -n kuadrant-system --type=merge --patch '{
     "enabled": true,
     "certSecretRef": {"name": "authorino-server-cert"}
   }}}}'
-
-oc -n kuadrant-system set env deployment/authorino \
-  SSL_CERT_FILE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt \
-  REQUESTS_CA_BUNDLE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt
-
-oc wait --for=condition=Available deployment/authorino -n kuadrant-system --timeout=300s
 ```
+
+#### (b) CA bundle — create the ConfigMap and MOUNT it
+
+**This step is missing from most guides and is easy to skip.** The environment variables in (c) point at a file path; nothing creates that file unless you mount it. Setting the variables without the mount fails *open*: Go silently ignores an unreadable `SSL_CERT_FILE` and falls back to the container's default CA bundle, which contains public CAs but **not** the cluster service CA. Everything appears healthy until Authorino makes an outbound TLS call to a service-CA-signed in-cluster endpoint, then produces `x509: certificate signed by unknown authority` somewhere that looks unrelated.
+
+OpenShift's service-ca operator populates any ConfigMap carrying the inject annotation:
+
+```bash
+cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openshift-service-ca
+  namespace: kuadrant-system
+  annotations:
+    service.beta.openshift.io/inject-cabundle: "true"
+EOF
+
+sleep 5
+oc get configmap openshift-service-ca -n kuadrant-system -o jsonpath='{.data}' | jq 'keys'
+# ["service-ca.crt"]
+```
+
+Mount it **via the Authorino CR, not the Deployment.** The operator regenerates the deployment from the CR, so a `oc patch deployment` volume edit gets reconciled away. The CR has a first-class `spec.volumes` field for exactly this:
+
+```bash
+oc explain authorino.spec.volumes --recursive
+```
+
+On RHCL 1.4.2: `items[]` with `name`, `configMaps[]`, `secrets[]`, `mountPath` (required), and a nested `items[]` for key→path mapping.
+
+```bash
+oc patch authorino authorino -n kuadrant-system --type=merge --patch '{
+  "spec": {"volumes": {"items": [{
+    "name": "service-ca",
+    "configMaps": ["openshift-service-ca"],
+    "mountPath": "/etc/ssl/certs/openshift-service-ca",
+    "items": [{"key": "service-ca.crt", "path": "service-ca-bundle.crt"}]
+  }]}}}'
+```
+
+> **The `items` key→path mapping is load-bearing.** service-ca injects the bundle under the key `service-ca.crt`, but the environment variables expect a file named `service-ca-bundle.crt`. Without the mapping the file mounts under the wrong name and you have changed nothing — while every command still reports success.
+
+#### (c) Environment variables
+
+The Authorino CR has **no** env field (`oc explain authorino.spec --recursive | grep -i -A5 'env'` returns nothing), so this must be set on the Deployment:
+
+```bash
+oc -n kuadrant-system set env deployment/authorino SSL_CERT_FILE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt REQUESTS_CA_BUNDLE=/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt
+
+oc rollout status deployment/authorino -n kuadrant-system --timeout=300s
+```
+
+Run it on one line. Broken across lines with backslashes, a stray leading space produces a literal `\ SSL_CERT_FILE=...` argument in zsh.
+
+> Because this is a Deployment-level edit and the operator regenerates the Deployment from the CR, **re-check it after any Authorino CR change or operator upgrade.** On RHCL 1.4.2 it survived the CR-driven rollout in (b), but that is observed behaviour, not a guarantee.
+
+#### Verify all three
+
+```bash
+# The mount exists and contains a real certificate
+oc -n kuadrant-system exec deployment/authorino -- ls -l /etc/ssl/certs/openshift-service-ca/
+# service-ca-bundle.crt -> ..data/service-ca-bundle.crt
+
+oc -n kuadrant-system exec deployment/authorino -- head -1 /etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt
+# -----BEGIN CERTIFICATE-----
+
+# The env vars survived
+oc -n kuadrant-system set env deployment/authorino --list | grep -E 'SSL_CERT|REQUESTS_CA'
+
+# TLS listeners are up
+oc logs -n kuadrant-system deployment/authorino | head -5 | grep -E 'auth service'
+# "starting http auth service","port":5001,"tls":true
+# "starting grpc auth service","port":50051,"tls":true
+```
+
+`"tls":true` on both the http and grpc auth services is the confirmation that (a) worked.
+
+### Other `Kuadrant.spec` fields worth knowing
+
+Confirm the schema on your cluster before assuming the CR above is valid:
+
+```bash
+oc get crd kuadrants.kuadrant.io -o jsonpath='{.spec.versions[*].name}{"\n"}'
+oc explain kuadrant.spec --recursive
+```
+
+On RHCL 1.4.2 the schema is `v1beta1` with three top-level areas. Two are not used by this runbook but matter for a customer build:
+
+| Field | What it does | Decision |
+|---|---|---|
+| `spec.mtls.{enable,authorino,limitador}` | Mutual TLS between the gateway and the Kuadrant data plane | **Off for the PoC.** This is a *different* mechanism from the Authorino server-cert TLS configured below — that one is required, this one is defence in depth. Raise it for the customer build: it is a supported field, not a workaround, and a security team may require it. Enabling it adds another failure surface, so do not turn it on while first bringing MaaS up. |
+| `spec.observability.tracing.defaultEndpoint` | OpenTelemetry trace export | Optional. Gives you spans across Authorino → Limitador → IPP → AWS in one trace, alongside the token metrics. Useful when the customer asks "where did the latency go?" Add after Part 6 works. |
+| `spec.components.developerPortal.enabled` | Kuadrant developer portal | Not used here. |
 
 ### Verify
 
@@ -286,7 +381,11 @@ oc get deployment authorino -n kuadrant-system \
   -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
 ```
 
-Authorino, Limitador, and the Kuadrant operator should be Running. Confirm the Authorino image is **0.23.1 or newer** — this is the functional check that matters more than any version string.
+Authorino, Limitador, and the Kuadrant operator should be Running.
+
+> **You cannot read the Authorino runtime version, so do not try.** Red Hat's build strips the ldflags, so the startup log reports `"version":"unknown","commit":"unknown"`, and the image is pinned by digest (`registry.redhat.io/rhcl-1/authorino-rhel9@sha256:...`) with no readable tag. `relatedImages` on the CSV gives the same digest.
+>
+> Header stripping — the mechanism that stops the analyst's token reaching AWS — requires Authorino 0.23.1+. RHCL 1.4.2 is well past that, but since the version is unverifiable, **confirm it functionally in Part 6 (§6.5)** by proving the upstream never receives the caller's Authorization header. Do not treat the `authorino-operator` CSV version as evidence: that is a different version line from the runtime.
 
 ### If the Kuadrant CR fails
 
@@ -1735,9 +1834,33 @@ curl -sk -o /dev/null -w "bypass attempt: %{http_code}\n" \
   -d '{"model":"bedrock-claude-sonnet","messages":[{"role":"user","content":"hi"}],"max_tokens":50}'
 ```
 
-## 6.5 The security proof
+## 6.5 The security proof — verify header stripping functionally
 
-Worth stating explicitly to the security team: Authorino validates the caller's credential and **strips the Authorization header before forwarding**; the Bedrock ABSK key is injected separately from the Kubernetes Secret. The user's token never reaches AWS and the AWS key never reaches the user. This requires RHCL 1.3+ / Authorino 0.23.1+ — which is why the version floor in §2.2 is not optional.
+Authorino validates the caller's credential and **strips the Authorization header before forwarding**; the Bedrock ABSK key is injected separately from the Kubernetes Secret. The user's token never reaches AWS and the AWS key never reaches the user.
+
+This requires Authorino 0.23.1+. **The runtime version is not readable** (see §2.3), so verify the behaviour rather than the version. This is a required gate, not an optional extra — the whole customer pitch rests on it.
+
+```bash
+# Watch what the payload processor forwards upstream
+oc logs -n openshift-ingress -l app=payload-processing -f --tail=0 &
+
+# Send a request with a recognisable key
+curl -sk "${MAAS_GW}/${MODEL_NS}/bedrock-claude-sonnet/v1/chat/completions" \
+  -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" \
+  -d '{"model":"bedrock-claude-sonnet","messages":[{"role":"user","content":"hi"}],"max_tokens":50}' >/dev/null
+
+sleep 3; kill %1
+```
+
+What you are checking: the outbound request carries the **ABSK** credential, not the caller's MaaS key. If IPP logs redact headers, prove it from the other end instead — temporarily point an `ExternalModel` at a request-echo service you control (`endpoint: <your-echo-host>`) and inspect what arrives. On a customer engagement this is worth doing once, with the security team watching.
+
+**Negative control:** delete the `bedrock-api-key` Secret's `bbr-managed` label and re-run. AWS should reject the call, proving the ABSK key is injected by IPP from the Secret rather than passed through from the client. Re-label afterwards.
+
+```bash
+oc label secret bedrock-api-key -n ${MODEL_NS} inference.networking.k8s.io/bbr-managed- 
+# re-run the curl → expect an auth failure from AWS
+oc label secret bedrock-api-key -n ${MODEL_NS} inference.networking.k8s.io/bbr-managed=true --overwrite
+```
 
 ## 6.6 Talking points
 
@@ -1776,6 +1899,10 @@ Worth stating explicitly to the security team: Authorino validates the caller's 
 | No MaaS CRDs | `aigateway`/`modelsAsAService` not Managed | §2.8 — note the **AsA** spelling |
 | `modelsAsService` patch rejected | CEL blocks `Removed→Managed` on the deprecated field | Use `aigateway.modelsAsAService` |
 | Kuadrant `MissingDependency` | Istio race | Restart kuadrant-operator pod (§2.3) |
+| `x509: certificate signed by unknown authority` from Authorino | CA bundle env vars set but nothing mounted at that path — fails open, surfaces later | §2.3(b) — create the inject-cabundle ConfigMap and mount it via the Authorino CR |
+| CA bundle mount disappears after an operator change | Volume was patched on the Deployment, not the CR | Patch `authorino.spec.volumes`; the operator regenerates the Deployment |
+| Mounted file exists but has the wrong name | Missing key->path mapping | service-ca injects `service-ca.crt`; env vars expect `service-ca-bundle.crt` (§2.3b) |
+| `SSL_CERT_FILE` missing after an Authorino CR change | CR has no env field; `set env` edits the Deployment | Re-apply §2.3(c) and re-verify |
 | Orchestrator 401 to MaaS | `passthrough_headers` missing | Add `authorization` to the list (§5.3) |
 | Orchestrator can't reach detector | Wrong service hostname | `oc get svc -n ${GR_NS}` and match exactly |
 | HAP InferenceService not Ready | Stale runtime or model image | Pull current refs from the 3.5 guardrails docs |
@@ -1839,7 +1966,12 @@ aws iam delete-service-specific-credential \
 
 --- Part 2: platform ---
 [ ] §2.2 RHCL installed, v1.4.2+, Authorino image 0.23.1+
-[ ] §2.3 Kuadrant CR Ready; authorino + limitador Running; TLS listener + env vars set
+[ ] §2.3 Kuadrant CR Ready; authorino + limitador Running
+[ ] §2.3 (a) TLS listener enabled — logs show "tls":true on http AND grpc auth services
+[ ] §2.3 (b) openshift-service-ca ConfigMap injected; mounted via Authorino CR spec.volumes
+[ ]        with key->path mapping service-ca.crt -> service-ca-bundle.crt
+[ ] §2.3 (b) File verified in-container: ls shows service-ca-bundle.crt, head shows BEGIN CERTIFICATE
+[ ] §2.3 (c) SSL_CERT_FILE + REQUESTS_CA_BUNDLE set on the Deployment and still present after rollout
 [ ] §2.4 User Workload Monitoring enabled
 [ ] §2.5 GatewayConfig Ready; data-science-gateway Programmed (platform-created — do NOT build one)
 [ ] §2.5 MAAS_GW derived from gatewayconfig status.domain (NOT maas.<domain>)
@@ -1878,6 +2010,7 @@ aws iam delete-service-specific-credential \
 [ ] 403 bogus / 401 no-auth / ratelimit headers
 [ ] Live 429 on the trial subscription
 [ ] Key revocation without AWS rotation
+[ ] Header stripping verified functionally (§6.5) — REQUIRED, version is unreadable
 [ ] PII blocked, toxic prompt blocked
 [ ] Token metrics visible per team
 ```
@@ -2147,6 +2280,7 @@ Do this **before** Part 4 — changing identity afterwards invalidates issued AP
 [ ] Groups agreed for MaaSAuthPolicy and per-department MaaSSubscription
 [ ] Air-gapped? Image mirroring plan covers RHOAI, RHCL, and guardrails detectors
 [ ] Gateway/Limitador HA decided — the gateway is now on the analyst critical path
+[ ] Kuadrant `spec.mtls` decision made with the security team (off during bring-up, enable after Part 6 passes)
 [ ] ABSK key rotation runbook written and owned (two keys per IAM user enables zero-downtime)
 ```
 
