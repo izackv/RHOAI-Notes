@@ -489,6 +489,15 @@ allowedRoutes:
 
 You cannot simply edit the Gateway — it has `ownerReferences` to `GatewayConfig` and the operator reconciles changes away. See §2.8 for how the MaaS component handles this.
 
+**Note the allowlist as it stands now**, before enabling MaaS — §2.8's discovery compares against this baseline to see whether the operator extends it for you. Capture it into the site record sheet (Appendix F):
+
+```bash
+oc get gateway data-science-gateway -n openshift-ingress \
+  -o jsonpath='{.spec.listeners[0].allowedRoutes.namespaces.selector}' | jq -c .
+```
+
+Reference cluster before §2.8: `openshift-ingress`, `redhat-ods-applications`.
+
 ### `GatewayConfig` fields (for the customer build)
 
 `GatewayConfig.spec` governs identity and ingress plumbing, not routing:
@@ -518,7 +527,25 @@ oc get route -n openshift-ingress -o custom-columns='NAME:.metadata.name,HOST:.s
 curl -vsk "${MAAS_GW}" 2>&1 | grep -E "SSL connection|Connected|HTTP/"
 ```
 
-A 403 or a redirect to an auth page is fine here — it proves TLS and routing work. MaaS endpoints do not exist until §2.8.
+Reference output at this stage:
+
+```
+* Connected to rh-ai.apps.<domain> (18.207.170.116) port 443
+* SSL connection using TLSv1.3 / AEAD-CHACHA20-POLY1305-SHA256
+< HTTP/1.1 404 Not Found
+```
+
+**404 is the expected and correct result.** You are testing three things — DNS resolves to a real address, TLS terminates, and the Route reaches the Gateway. All three passed. The 404 is the Gateway correctly reporting that no HTTPRoute matches `/`, because MaaS endpoints do not exist until §2.8.
+
+| Response to `curl "${MAAS_GW}"` | Meaning |
+|---|---|
+| **404** | Correct at this stage. Gateway is live, no routes match `/` yet. |
+| 403, or a redirect to a login page | Also fine — some configurations put the auth proxy in front of the catch-all |
+| `Could not resolve host` | DNS/Route problem — check `oc get route -n openshift-ingress` |
+| `Connection refused` / timeout | Gateway pod not running, or `ingressMode` mismatch — check `oc get pods -n openshift-ingress` |
+| TLS handshake failure | Certificate problem — check `gatewayconfig.spec.certificate` and the listener's `certificateRefs` |
+
+Do **not** try to make `/` return 200. It has no route and is not supposed to.
 
 ### Fallback: no Gateway was created
 
@@ -561,6 +588,29 @@ oc get secret maas-db-config -n redhat-ods-applications
 ```
 
 For RDS: `postgresql://USER:PASSWORD@HOST:5432/DATABASE?sslmode=require`
+
+### Verify before continuing
+
+Ten seconds here saves a confusing `maas-api` crash-loop at §2.8 that looks like a MaaS fault but is actually a password.
+
+```bash
+# Deployment (not DeploymentConfig), pod Running, service on 5432
+oc get deployment,pods,svc -n maas-db
+
+# Credentials actually work
+oc exec -n maas-db deployment/maas-postgres -- \
+  psql "postgresql://maas:${PGPASS}@localhost:5432/maas" -c '\conninfo'
+# You are connected to database "maas" as user "maas" ...
+
+# The connection URL survived the shell intact (password masked)
+oc get secret maas-db-config -n redhat-ods-applications \
+  -o jsonpath='{.data.DB_CONNECTION_URL}' | base64 -d | sed 's/:[^:@]*@/:****@/'
+# postgresql://maas:****@maas-postgres.maas-db.svc.cluster.local:5432/maas?sslmode=disable
+```
+
+The masked URL must have exactly one `@` and no extra `/` or `:` inside the masked section. If it does, the password contained a URL delimiter and the string is malformed — pick a password without `$ @ / : #` and redo the secret.
+
+> **`oc new-app` gives you emptyDir, not a PVC.** The API-key store dies with the pod, so a restart invalidates every issued MaaS key. Acceptable for a demo you rebuild anyway; it is why Appendix E says use RDS or a PVC-backed instance at a customer site.
 
 **Console:** **Workloads → Secrets → Create → Key/value secret**, project `redhat-ods-applications`, name `maas-db-config`, key `DB_CONNECTION_URL`.
 
@@ -648,15 +698,72 @@ oc get dsc -w        # wait for READY True, then Ctrl-C
   ```
   The one exception is `kserve.modelsAsService`, whose CEL rule blocks `Removed→Managed`. That field is deprecated and you are not using it.
 
-### Verify
+### Verify the platform
 
 ```bash
-oc get dsc default-dsc
+oc get dsc default-dsc                       # READY True
 oc get pods -n redhat-ods-applications
 oc get route -n redhat-ods-applications rhods-dashboard -o jsonpath='{.spec.host}{"\n"}'
+echo "$MAAS_GW"
 ```
 
-Open the dashboard URL. You should be able to log in and see Workbenches. That confirms RHOAI proper is healthy before you layer MaaS on top.
+**Two dashboard URLs is normal on 3.5.** The classic Route (`rhods-dashboard-redhat-ods-applications.apps.<domain>`) coexists with the gateway host (`$MAAS_GW`), and `dashboard-redirect` pods bridge them — 3.5 is moving the UI behind the gateway. Both should load.
+
+Reading the pod list, three things surprise people coming from 3.4:
+
+| Pod | Note |
+|---|---|
+| `maas-ui` | Present even though `aigateway` is **Removed**. The dashboard ships the MaaS UI regardless; it has no backend yet. Do **not** read this as MaaS being enabled. |
+| `llmisvc-controller-manager`, `model-serving-api` | New 3.5 serving controllers, absent from 3.4-era guides. MaaS wiring hooks into these. |
+| `workbenches-operator` with `RESTARTS 1` | A startup race while CRDs register. Benign if the count stays at 1. Investigate only if it climbs. |
+
+### Smoke-test a workbench — do this BEFORE enabling MaaS
+
+This is the gate between "RHOAI is installed" and "MaaS is added." If workbenches work now and break later, you know what changed. The workbench you create here is reused for Demo 1 in §6.2, so this is not throwaway work.
+
+**Pre-checks:**
+
+```bash
+oc get crd notebooks.kubeflow.org
+oc get imagestream -n redhat-ods-applications -o name | grep -iE 'datascience|minimal|pytorch'
+oc get pods -n redhat-ods-applications | grep -E 'notebook|workbench'
+```
+
+An empty imagestream list means images are still importing — wait a few minutes.
+
+**Create it (console):**
+
+1. Open the dashboard and log in
+2. **Data Science Projects → Create project** → `bedrock-demo`
+3. **Workbenches → Create workbench**
+   - Image: **Standard Data Science** — it has `pip`, which §6.2 needs for the `openai` package
+   - Container size: **Small**
+   - Storage: **Create new persistent storage**, 20Gi (uses the default StorageClass)
+4. Create
+
+```bash
+oc get pods -n bedrock-demo -w
+oc get notebook,pvc -n bedrock-demo
+```
+
+First start pulls a large image — several minutes is normal.
+
+**Prove it works.** Open the workbench, start a notebook, and run:
+
+```python
+import sys, requests
+print(sys.version)
+print(requests.get("https://api.github.com", timeout=5).status_code)
+```
+
+Python version plus `200` confirms the notebook runs **and has egress** — which it needs to reach the MaaS gateway in §6.2. A hang or connection error here means network policy or a proxy, and it is much easier to diagnose now than when it looks like a MaaS failure later.
+
+| Symptom | Cause |
+|---|---|
+| Workbench stuck Pending | No default StorageClass, or PVC unbound — `oc get pvc -n bedrock-demo` |
+| ImagePullBackOff | Imagestreams still importing, or a pull-secret problem |
+| No images offered in the form | Imagestreams not yet imported — wait and reload |
+| Notebook starts, `requests` call hangs | Egress blocked. Resolve before §6.2 |
 
 **Console:** **Administration → CustomResourceDefinitions → DataScienceCluster → Instances → Create DataScienceCluster** (YAML view), or masthead **+** → **Import YAML**.
 
@@ -743,14 +850,7 @@ curl -sk "${MAAS_GW}/maas-api/health"
 | | 503 | `maas-api` not ready yet; wait and retry |
 | **Tenant resource** | `Tenant`, or `AITenant`/`MaasTenantConfig` | Record which; 3.5 GA may use either. `Ready=False` with `DeploymentsNotReady` is **expected** until a model is registered in Part 4 |
 
-**Record the answers.** The four values Parts 4–6 depend on:
-
-```
-MAAS_GW           = ________________________________
-Model path prefix = ________________________________   (e.g. /<ns>/<model>/v1)
-Namespace admission mechanism = _______________________  (operator-managed / GatewayConfig / label)
-Tenant CRD kind   = ________________________________
-```
+**Record the answers in Appendix F.** Parts 4–6 depend on four values: `MAAS_GW`, the model path prefix, the namespace admission mechanism, and the tenant CRD kind.
 
 ### If `maas-api` crash-loops
 
@@ -1715,10 +1815,10 @@ curl -sk "${MAAS_GW}/maas-api/health"
 
 This is the strongest opener: it looks exactly like what the analysts already do.
 
-**Create the workbench.** RHOAI dashboard → **Data Science Projects → Create project** (`bedrock-demo`) → **Workbenches → Create workbench**. Image: *Standard Data Science*. Size: Small. Storage: 20Gi on `gp3-csi`.
+**Use the workbench created in §2.7.** If you skipped that smoke test, create it now: RHOAI dashboard → **Data Science Projects → Create project** (`bedrock-demo`) → **Workbenches → Create workbench**. Image *Standard Data Science*, size Small, 20Gi storage.
 
 ```bash
-oc get pods -n bedrock-demo -w    # wait for the notebook pod to be Running
+oc get pods -n bedrock-demo    # notebook pod Running
 ```
 
 **Mint a key for the notebook:**
@@ -1977,7 +2077,8 @@ aws iam delete-service-specific-credential \
 [ ] §2.5 MAAS_GW derived from gatewayconfig status.domain (NOT maas.<domain>)
 [ ] §2.5 Namespace allowlist mechanism recorded (name-based matchExpressions on reference cluster)
 [ ] §2.6 PostgreSQL running; maas-db-config in redhat-ods-applications
-[ ] §2.7 DSC applied and Ready; dashboard reachable
+[ ] §2.7 DSC applied and Ready; dashboard reachable (both classic Route and $MAAS_GW)
+[ ] §2.7 Workbench smoke test passed — notebook runs AND has egress (reused in §6.2)
 [ ] §2.8 aigateway + modelsAsAService Managed  (spelling: AsA)
 [ ] §2.8 Discovery block run; four values recorded (MAAS_GW, path prefix, ns admission, tenant kind)
 [ ] §2.8 MaaS CRDs present; maas-api 1/1; IPP 1/1; /maas-api/health healthy
@@ -2287,3 +2388,45 @@ Do this **before** Part 4 — changing identity afterwards invalidates issued AP
 ## Discipline for this document
 
 Every discovery command in this runbook is written as **"run this, read the result this way, act accordingly"** rather than a fixed answer, because a customer cluster may reconcile differently. Where a value appears from the reference cluster, it is labelled as such. If a step at a customer site produces a different result than documented, that is new information about RHOAI 3.5 GA — record it here rather than working around it locally.
+
+---
+
+# Appendix F — Site record sheet
+
+Fill this in once per environment, as you work through Part 2. Parts 4–6 read from it. Copy the table for each new site rather than editing in place, so the reference cluster stays available for comparison.
+
+| Fact | How to get it | Reference cluster (sandbox) | Your site |
+|---|---|---|---|
+| Cluster domain | `oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}'` | `apps.rhoai.<sandbox-id>.opentlc.com` | |
+| **MAAS_GW** | `oc get gatewayconfig default-gateway -o jsonpath='{.status.domain}'` | `https://rh-ai.apps.rhoai.<sandbox-id>.opentlc.com` | |
+| OCP version | `oc get clusterversion version -o jsonpath='{.status.desired.version}'` | 4.22.10 | |
+| Platform | `oc get infrastructure cluster -o jsonpath='{.status.platform}'` | AWS | |
+| RHOAI CSV | `oc get csv -n redhat-ods-operator` | `rhods-operator.3.5.0` (GA, `stable-3.5`) | |
+| RHCL CSV | `oc get csv -n openshift-operators \| grep rhcl` | `rhcl-operator.v1.4.2` | |
+| GatewayClass | `oc get gatewayclass` | `data-science-gateway-class` | |
+| Gateway | `oc get gateway -A` | `data-science-gateway` / `openshift-ingress` | |
+| Ingress mode | `oc get gatewayconfig default-gateway -o jsonpath='{.spec.ingressMode}'` | `OcpRoute` | |
+| Ingress cert secret | `oc get ingresscontroller default -n openshift-ingress-operator -o jsonpath='{.spec.defaultCertificate.name}'` | (default) | |
+| Default StorageClass | `oc get storageclass \| grep default` | `gp3-csi` | |
+| **NS allowlist BEFORE §2.8** | `oc get gateway data-science-gateway -n openshift-ingress -o jsonpath='{.spec.listeners[0].allowedRoutes.namespaces.selector}'` | name-based: `openshift-ingress`, `redhat-ods-applications` | |
+| **NS allowlist AFTER §2.8** | same command | *(record during §2.8 discovery)* | |
+| **NS admission mechanism** | §2.8 discovery | *(operator-managed / GatewayConfig / label)* | |
+| **Model path prefix** | §2.8 discovery | *(e.g. `/<ns>/<model>/v1`)* | |
+| **Tenant CRD kind** | `oc get crd \| grep -i tenant` | *(`Tenant` / `AITenant` / `MaasTenantConfig`)* | |
+| Payload processor | `oc get pods -n openshift-ingress -l app=payload-processing` | *(record during §2.8)* | |
+| AWS region | chosen in §3.1 | `us-east-1` | |
+| Bedrock IAM user | §3.5 | `rhoai-maas-bedrock` | |
+| Model namespace | §4.1 | `external-models` | |
+| Models registered | §4.3–4.4 | `bedrock-gpt-oss-20b`, `bedrock-claude-sonnet` | |
+| Guardrails namespace | §5.2 | `guardrails` | |
+
+**Environment-specific decisions** (see Appendix E for the reasoning):
+
+| Decision | Reference cluster | Your site |
+|---|---|---|
+| TLS certificate source | `OpenshiftDefaultIngress` (self-signed chain, `-k` required) | |
+| Identity provider | `system:authenticated` + OpenShift tokens | |
+| Database | in-cluster Postgres, emptyDir, no backup | |
+| Kuadrant mTLS | off | |
+| IAM policy | `AmazonBedrockLimitedAccess` (not tightened — throwaway account) | |
+| Groups for auth policy / subscriptions | `system:authenticated` | |
