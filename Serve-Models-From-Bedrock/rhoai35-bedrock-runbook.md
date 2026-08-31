@@ -702,6 +702,16 @@ curl -sk "${MAAS_GW}/maas-api/health"; echo
 >
 > Changing the hostname breaks nothing else: `AITenant` references the Gateway by **name**, not hostname. Only `MAAS_GW` changes, and everything downstream reads that variable.
 
+> ## ⚠ The listener hostname MUST be `maas.<cluster-domain>`
+>
+> The MaaS **UI** hardcodes `maas.<cluster-domain>` for its API calls — it does not read the listener hostname or `MaaSModelRef.status.endpoint`. Any other hostname gives you a fully working API via curl and a broken console: empty **AI hub → Models**, and **Gen AI studio → API keys** failing with `invalid character '<' looking for beginning of value` (the dashboard's HTML returned instead of JSON).
+>
+> So the hostname-change workaround below is a **last resort**. If `maas.<domain>` is unusable, fix DNS rather than renaming — and expect the console to stay broken until you do.
+>
+> ```bash
+> oc logs -n redhat-ods-applications deployment/maas-ui --tail=20 | grep -i endpoint
+> ```
+
 #### Read MAAS_GW from the cluster, never construct it
 
 Once you are on a Route, the hostname is whatever the Route says — not a formula:
@@ -713,6 +723,17 @@ curl -sk "${MAAS_GW}/maas-api/health"; echo
 ```
 
 Reference cluster after the on-prem switch: `https://maas-gw.apps.rhoai.<sandbox-id>.opentlc.com`. Record it in Appendix F — Parts 4, 5 and 6 all read it.
+
+### ALWAYS restart the gateway after a listener or Service change
+
+Observed twice: one of the two replicas keeps stale upstream config, producing ~50% `503 UC,DC` after 60s timeouts while the rest succeed in under a second.
+
+```bash
+oc rollout restart deployment/maas-default-gateway-data-science-gateway-class -n openshift-ingress
+oc rollout status deployment/maas-default-gateway-data-science-gateway-class -n openshift-ingress --timeout=300s
+```
+
+Then run the six-call stability loop from §4.7 before trusting the result.
 
 **Rollback to LoadBalancer:**
 
@@ -1627,14 +1648,41 @@ oc create secret generic bedrock-api-key \
   --from-literal=api-key="${BEDROCK_API_KEY}" \
   -n ${MODEL_NS} --dry-run=client -o yaml | oc apply -f -
 
+# CRITICAL: this label, not the one in the 3.4 docs. See the warning below.
 oc label secret bedrock-api-key -n ${MODEL_NS} \
-  inference.networking.k8s.io/bbr-managed=true --overwrite
+  inference.llm-d.ai/ipp-managed=true --overwrite
 
 oc get secret bedrock-api-key -n ${MODEL_NS} -o jsonpath='{.data.api-key}' | base64 -d | wc -c
 # 132
 ```
 
-**Console:** **Workloads → Secrets → Create → Key/value secret** in `external-models`. Name `bedrock-api-key`, key `api-key`. Then **Actions → Edit labels**.
+> ## ⚠ The documented Secret label is WRONG in 3.5 GA
+>
+> | | |
+> |---|---|
+> | **Required** | `inference.llm-d.ai/ipp-managed=true` |
+> | Documented (3.4-era, inert) | `inference.networking.k8s.io/bbr-managed=true` |
+>
+> The payload processor's `apikey-injection-secret-watcher` only caches Secrets carrying `inference.llm-d.ai/ipp-managed`. With the documented label the Secret is silently ignored and every inference call fails:
+>
+> ```
+> HTTP 500  inference error: Internal - authType 'apikey' credentials not found
+> ```
+>
+> No RBAC error, no warning — the credential store is simply empty. Nothing about the Secret's name, namespace, data key, or the `ExternalProvider` matters until this label is right. Verified by extracting strings from the IPP binary (`grep -a '/ipp-managed' /bbr`).
+>
+> **Confirm the watcher picked it up** — this line must appear within seconds of labelling:
+>
+> ```bash
+> oc logs -n openshift-ingress -l app=payload-processing --since=1m | grep -i 'Secret added'
+> # "Secret added/updated in store" ... "key":"external-models/bedrock-api-key"
+> ```
+>
+> If that line is absent, nothing downstream will work. Ruled out during diagnosis and **not** the cause: RBAC, the `api-key`/`apiKey` data-key name, the Secret's namespace, and model-level `auth` overrides.
+
+**Console:** **Workloads → Secrets → Create → Key/value secret** in `external-models`. Name `bedrock-api-key`, key `api-key`. Then **Actions → Edit labels** and add `inference.llm-d.ai/ipp-managed=true`.
+
+> Avoid `oc create ... --dry-run | oc apply` for Secrets: it writes the full base64 value into the `kubectl.kubernetes.io/last-applied-configuration` annotation, exposing the key in plaintext to anyone with read on the namespace. Use plain `oc create secret`.
 
 > Never commit this. For GitOps use External Secrets Operator or Sealed Secrets — the `ExternalProvider` CR itself is safe to commit, holding only a `secretRef`.
 
@@ -1712,6 +1760,57 @@ curl -s "https://bedrock-mantle.${AWS_REGION}.api.aws/v1/models" \
   | jq -r '.data[] | select(.status=="available") | .id' | sort
 ```
 
+### Verify the models attached to the gateway
+
+`Ready` on the CR only means the CR reconciled. These three checks prove the route actually bound to `maas-default-gateway` — the difference between "HTTPRoute exists" and "HTTPRoute is accepted".
+
+```bash
+oc get externalmodels.inference.opendatahub.io -n ${MODEL_NS}    # PHASE Ready
+oc get httproute -n ${MODEL_NS}                                   # one per model
+
+# 1. Which Gateway did it attach to?
+oc get httproute bedrock-claude-sonnet -n ${MODEL_NS} \
+  -o jsonpath='{.spec.parentRefs}{"\n"}'
+
+# 2. Was it accepted, and did Kuadrant attach its policies?
+oc get httproute bedrock-claude-sonnet -n ${MODEL_NS} \
+  -o jsonpath='{range .status.parents[*].conditions[*]}{.type}={.status}{"\n"}{end}'
+
+# 3. What path does it serve? (defines your inference URL)
+oc get httproute bedrock-claude-sonnet -n ${MODEL_NS} \
+  -o jsonpath='{.spec.rules[*].matches[*].path}{"\n"}'
+```
+
+Reference output:
+
+```
+parentRef:  name: maas-default-gateway, namespace: openshift-ingress
+
+Accepted=True
+ResolvedRefs=True
+kuadrant.io/AuthPolicyAffected=True
+kuadrant.io/TokenRateLimitPolicyAffected=True
+
+{"type":"PathPrefix","value":"/external-models/bedrock-claude-sonnet"}
+```
+
+| Condition | Meaning if False |
+|---|---|
+| `Accepted` | Route rejected by the listener. Usually the namespace is missing `maas.opendatahub.io/gateway-access=true` (§4.1) — check this first |
+| `ResolvedRefs` | A backend reference is unresolvable; check the ExternalProvider and its Secret |
+| `kuadrant.io/AuthPolicyAffected` | Authorino is **not** protecting this route — the endpoint may be open. Investigate before demoing |
+| `kuadrant.io/TokenRateLimitPolicyAffected` | Limitador is not metering this route; quotas will not apply |
+
+> **The two Kuadrant conditions appear before you create any `MaaSAuthPolicy` or `MaaSSubscription`.** MaaS attaches default gateway-level policies as soon as a model route exists. Your §4.6 objects refine who and how much; they are not what turns protection on.
+
+The path prefix gives you the inference URL:
+
+```
+${MAAS_GW}/<model-namespace>/<model-name>/v1/chat/completions
+```
+
+On the reference cluster: `https://maas-gw.apps.<sandbox-id>.../external-models/bedrock-claude-sonnet/v1/chat/completions`
+
 > **Model choice for the demo.** `gpt-oss-20b` is a reasoning model — reasoning tokens count against `max_tokens` and against your metering, so the analyst sees three words while chargeback shows hundreds of tokens. That muddies the metering story. Use `anthropic.claude-sonnet-5` or `anthropic.claude-haiku-4-5` for anything customer-facing; keep `gpt-oss-20b` for cheap plumbing tests.
 >
 > Both models here use `apiFormat: openai-chat` because Bedrock Mantle presents an OpenAI-compatible API even for Anthropic models. Use `messages` only against the Anthropic API directly.
@@ -1748,7 +1847,43 @@ oc get maasmodelref -n ${MODEL_NS}
 
 `modelRef.kind` accepts `ExternalModel` or `LLMInferenceService` — the latter is how you would expose an on-prem vLLM model through the same gateway. Optional fields: `endpointOverride` and `tenantRef` (defaults to the single tenant).
 
-### Verify
+### Expect `Pending` here — this is by design
+
+Immediately after creating the MaaSModelRefs:
+
+```
+NAME                    PHASE     ENDPOINT   HTTPROUTE               GATEWAY
+bedrock-claude-sonnet   Pending              bedrock-claude-sonnet   maas-default-gateway
+```
+
+**`Pending` with an empty ENDPOINT is correct at this point.** It does not clear on its own — waiting will not help. `oc describe` shows why:
+
+```
+GovernanceAttached  False  NoPairingFound   "No active subscription and auth policy pairing found"
+RuntimeReady        True   RuntimeHealthy   "Backend is healthy"
+Ready               False  BackendNotReady  "Awaiting governance pairing"
+```
+
+**MaaS refuses to expose a model until both a `MaaSAuthPolicy` and a `MaaSSubscription` reference it.** A model cannot be reachable without someone having declared who may call it and how much they may spend. Complete §4.6 and it flips to Ready within seconds.
+
+| Condition | Reading |
+|---|---|
+| `RuntimeReady=True` | **The provider connection works.** Your ExternalProvider, Secret and Bedrock endpoint are all correct — a strong signal that Part 3 and §4.3 are sound |
+| `GovernanceAttached=False` / `NoPairingFound` | Normal before §4.6. If it persists *after* §4.6, the `modelRefs[].name`/`namespace` in the policy or subscription do not match the MaaSModelRef |
+| `RuntimeReady=False` | A real problem — provider, Secret, or endpoint. Do not proceed to §4.6 |
+
+> **Worth saying out loud to the customer.** Ungoverned exposure is not possible by construction: no auth policy and no subscription means no endpoint. This is not a setting an administrator can forget to switch on.
+
+After §4.6 completes:
+
+```
+NAME                    PHASE   ENDPOINT                                      HTTPROUTE               GATEWAY
+bedrock-claude-sonnet   Ready   https://maas-gw.apps.<sandbox-id>...          bedrock-claude-sonnet   maas-default-gateway
+```
+
+The ENDPOINT is read live from the Gateway listener, so it reflects any hostname change made in §2.5(f).
+
+### Verify (after §4.6 — see the note above)
 
 ```bash
 oc get externalprovider,externalmodels.inference.opendatahub.io,maasmodelref -n ${MODEL_NS}
@@ -1764,6 +1899,83 @@ oc describe maasmodelref bedrock-claude-sonnet -n ${MODEL_NS}
 oc describe externalmodels.inference.opendatahub.io bedrock-claude-sonnet -n ${MODEL_NS}
 oc get namespace ${MODEL_NS} --show-labels | grep gateway-access   # the usual culprit
 ```
+
+## 4.5b Fix the generated HTTPRoute — REQUIRED
+
+**The route the controller generates cannot match any request.** Without this fix every inference call returns `404 route_not_found` from Envoy.
+
+### The bug
+
+The generated HTTPRoute carries four rules. The catch-all (`PathPrefix: /`) matches on header `X-Gateway-Model-Name` set to the **`targetModel`**:
+
+```yaml
+matches:
+  - headers:
+      - name: X-Gateway-Model-Name
+        value: openai.gpt-oss-20b        # targetModel
+    path: {type: PathPrefix, value: /}
+```
+
+But the pre-processing IPP sets that header from the request body's `model` field, which is the **`modelName`** clients use:
+
+```
+bodyfieldtoheader: "parsed field from body"  field=model  value="bedrock-gpt-oss-20b"
+```
+
+`bedrock-gpt-oss-20b` ≠ `openai.gpt-oss-20b`, so the rule never matches.
+
+### The fix
+
+```bash
+for m in bedrock-gpt-oss-20b bedrock-claude-sonnet; do
+  oc patch httproute $m -n ${MODEL_NS} --type=json \
+    -p "[{\"op\":\"replace\",\"path\":\"/spec/rules/3/matches/0/headers/0/value\",\"value\":\"$m\"}]"
+done
+
+# Confirm and re-check after a minute — the controller may reconcile it away
+oc get httproute bedrock-gpt-oss-20b -n ${MODEL_NS} \
+  -o jsonpath='{.spec.rules[3].matches[0].headers[0].value}'; echo
+sleep 60
+oc get httproute bedrock-gpt-oss-20b -n ${MODEL_NS} \
+  -o jsonpath='{.spec.rules[3].matches[0].headers[0].value}'; echo
+```
+
+On the reference cluster the patch **survived** reconciliation. Re-check it before any demo, and re-apply after any `ExternalModel` change — editing the model triggers a route rebuild.
+
+Verify rule 3 is the right index first; the layout may differ:
+
+```bash
+oc get httproute bedrock-gpt-oss-20b -n ${MODEL_NS} -o jsonpath='{.spec.rules}' | python3 -m json.tool | grep -n 'X-Gateway-Model-Name' -A2
+```
+
+## 4.5c The client endpoint
+
+**Clients call the gateway root with the model in the body — OpenAI style.** Not the namespaced path.
+
+| | |
+|---|---|
+| ✅ **Correct** | `${MAAS_GW}/v1/chat/completions` with `{"model": "bedrock-gpt-oss-20b", ...}` |
+| ❌ Wrong | `${MAAS_GW}/external-models/bedrock-gpt-oss-20b/v1/chat/completions` |
+
+The namespaced path *does* route to AWS, but Bedrock receives the full prefix as its own path and returns **404 with an `x-amzn-requestid` header** — an AWS error, not a cluster one. That header is the giveaway: if a 404 carries `x-amzn-requestid`, the request reached AWS and the path is wrong; if Envoy logs `route_not_found`, it never left the cluster.
+
+This matches the catalogue, where `/maas-api/v1/models` returns `url` as the bare gateway host with no path.
+
+### apiFormat must match the model
+
+| Model family on Bedrock Mantle | `apiFormat` | `path` |
+|---|---|---|
+| OpenAI (`openai.gpt-oss-*`) | `openai-chat` | `/v1/chat/completions` |
+| Anthropic (`anthropic.claude-*`) | see note | see note |
+
+If a model rejects the API you send, AWS says so precisely:
+
+```json
+{"error":{"code":"validation_error",
+ "message":"The model 'anthropic.claude-sonnet-5' does not support the '/v1/chat/completions' API"}}
+```
+
+**Unresolved:** switching Claude to `apiFormat: messages` with `path: /v1/messages` produced a 404 from AWS. The correct Mantle path for Anthropic-native format was not determined. **Use an OpenAI-family model for the demo** — `openai.gpt-oss-20b` is verified working end to end.
 
 ## 4.6 Access policy and quota
 
@@ -1832,7 +2044,12 @@ spec:
           window: "1h"
 EOF
 
+sleep 20
 oc get maasauthpolicy,maassubscription -n models-as-a-service
+# both PHASE Active
+
+oc get maasmodelref -n ${MODEL_NS}
+# PHASE now Ready, ENDPOINT populated — the governance pairing from §4.5 is satisfied
 ```
 
 - **`MaaSAuthPolicy`** — *who may call*. Enforced by Authorino.
@@ -1850,29 +2067,25 @@ For the real engagement, replace `system:authenticated` with actual OpenShift or
 
 **Console:** **Settings → MaaS governance** (enabled in §2.9) manages policies and subscriptions.
 
-## 4.7 Smoke test
+## 4.7 Smoke test — verified working
 
 ```bash
-# LoadBalancer gateway: maas.<cluster-domain>. On a Route (§2.5f), read it from the Route:
 export MAAS_GW="https://$(oc get route maas-gateway -n openshift-ingress -o jsonpath='{.spec.host}' 2>/dev/null || echo "maas.$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')")"
-echo "MAAS_GW=$MAAS_GW"
 curl -sk "${MAAS_GW}/maas-api/health"; echo    # {"status":"healthy"}
 ```
 
-You need an OpenShift **token** to call the MaaS admin API — the gateway sits behind `kube-auth-proxy`, so certificate-based kubeconfig auth is not enough:
+The MaaS admin API sits behind `kube-auth-proxy`, so you need an OpenShift **token** — certificate-based kubeconfig auth is not enough:
 
 ```bash
-oc whoami -t || echo "no token — log in with one"
-# If empty: oc login -u <user> -p <password> --server=https://api.<cluster>:6443
-# or console top-right → Copy login command → Display Token
+oc whoami -t || echo "no token — oc login -u <user> -p <password>, or console → Copy login command → Display Token"
 ```
 
-> **Two different credentials, easy to confuse.** The OpenShift token authenticates *you* to the MaaS admin API. The MaaS API key it returns is what an *analyst* uses to call models. You need the first to create the second.
+> **Two different credentials.** The OpenShift token authenticates *you* to the MaaS admin API. The MaaS API key it returns is what an *analyst* uses to call models. You need the first to create the second.
 
 ```bash
-# Catalog
+# Catalogue
 curl -sk "${MAAS_GW}/maas-api/v1/models" \
-  -H "Authorization: Bearer $(oc whoami -t)" | jq -r '.data[].id'
+  -H "Authorization: Bearer $(oc whoami -t)" | jq -r '.data[] | "\(.id)  ready=\(.ready)"'
 
 # Mint an analyst key
 API_KEY=$(curl -sk -X POST "${MAAS_GW}/maas-api/v1/api-keys" \
@@ -1880,17 +2093,74 @@ API_KEY=$(curl -sk -X POST "${MAAS_GW}/maas-api/v1/api-keys" \
   -d '{"name":"demo-key","subscription":"analysts-standard","expiresIn":"24h"}' | jq -r '.key')
 echo "${API_KEY:0:12}..."
 
-# Inference
-curl -sk "${MAAS_GW}/${MODEL_NS}/bedrock-claude-sonnet/v1/chat/completions" \
+# INFERENCE — root path, model in the body
+curl -sk -m 120 "${MAAS_GW}/v1/chat/completions" \
   -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" \
-  -d '{"model":"bedrock-claude-sonnet","messages":[{"role":"user","content":"Say hello in 3 words."}],"max_tokens":300}' | jq .
+  -d '{"model":"bedrock-gpt-oss-20b","messages":[{"role":"user","content":"Say hello in 3 words."}],"max_tokens":300}' | jq .
 ```
 
-**Console alternative:** **Gen AI studio → API keys** mints and revokes keys in the UI — better for a non-technical audience than curl.
+Verified response shape:
 
-> `max_tokens` generously — **300, not 20**. Reasoning models spend the budget on reasoning tokens and return `finish_reason: "length"` with `content: null`, which looks broken but is only truncated. If `usage.completion_tokens` equals your `max_tokens`, that is what happened.
+```json
+{"choices":[{"finish_reason":"stop","message":{
+   "content":"Hello, friend, world!",
+   "reasoning":"The user asks...","role":"assistant"}}],
+ "model":"openai.gpt-oss-20b",
+ "usage":{"completion_tokens":214,"prompt_tokens":74,"total_tokens":288}}
+```
 
-Save the key — Parts 5 and 6 use it. Record `MAAS_GW` and the model path prefix in Appendix F.
+Note `model` in the response is the **targetModel** — proof the gateway substituted it. And `usage.total_tokens` is what Limitador meters and what a chargeback report is built from.
+
+**Console alternative:** **Gen AI studio → API keys** mints and revokes keys in the UI — better than curl for a non-technical audience.
+
+### Prove stability before demoing
+
+```bash
+for i in $(seq 1 6); do
+  curl -sk -o /dev/null -w "call $i: %{http_code} in %{time_total}s\n" -m 60 \
+    "${MAAS_GW}/v1/chat/completions" -H "Authorization: Bearer ${API_KEY}" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"bedrock-gpt-oss-20b","messages":[{"role":"user","content":"hi"}],"max_tokens":300}'
+done
+```
+
+Want six 200s around 1s each. Reference cluster: 0.92–1.60s.
+
+> ## ⚠ Intermittent 503s = one bad gateway replica
+>
+> If roughly half your calls return **503 after ~60 seconds** while the rest succeed in under a second, the gateway has two replicas and one is serving stale upstream configuration. Envoy logs `UC,DC downstream_remote_disconnect` — and the *pod address* differs between failures and successes:
+>
+> ```
+> 503 UC,DC  10.129.2.41  59382ms     ← stale replica
+> 200        10.131.0.44    409ms     ← healthy replica
+> ```
+>
+> ```bash
+> oc logs -n openshift-ingress -l gateway.networking.k8s.io/gateway-name=maas-default-gateway \
+>   --tail=20 | grep 'chat/completions'
+> ```
+>
+> Compare the second-to-last IP column across 200s and 503s. Fix:
+>
+> ```bash
+> oc rollout restart deployment/maas-default-gateway-data-science-gateway-class -n openshift-ingress
+> oc rollout status deployment/maas-default-gateway-data-science-gateway-class -n openshift-ingress --timeout=300s
+> ```
+>
+> Most likely after changing the gateway Service type (§2.5f) or the listener hostname. **Always run the six-call loop before a demo** — a coin-flip failure rate on camera is worse than no demo.
+
+### Interpreting failures
+
+| Symptom | Where it failed | Fix |
+|---|---|---|
+| `500 inference error: ... credentials not found` | IPP credential store | Secret label — §4.2 |
+| `404`, Envoy logs `route_not_found` | Envoy, never left the cluster | HTTPRoute header — §4.5b |
+| `404` **with `x-amzn-requestid`** | AWS — wrong path | Use the root endpoint — §4.5c |
+| `400 ... does not support the '/v1/...' API` | AWS — wrong apiFormat | §4.5c |
+| `403 x-ext-auth-reason: model_not_in_subscription` | Authorino — working correctly | Use `modelName`, not `targetModel`, in the body |
+| `503 UC,DC` ~50% of calls | One stale gateway replica | Restart the gateway (above) |
+
+Save the key — Parts 5 and 6 use it. Record `MAAS_GW` in Appendix F.
 
 # PART 5 — Guardrails
 
@@ -2403,9 +2673,18 @@ oc label secret bedrock-api-key -n ${MODEL_NS} inference.networking.k8s.io/bbr-m
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
+| HTTPRoute exists but `Accepted=False` | Namespace missing `maas.opendatahub.io/gateway-access=true` | `oc label namespace ${MODEL_NS} maas.opendatahub.io/gateway-access=true --overwrite` |
+| `kuadrant.io/AuthPolicyAffected` absent or False | Route not protected by Authorino — endpoint may be open | Check the Gateway's `opendatahub.io/managed: "false"` annotation (§2.5d) |
+| `MaaSModelRef` Pending, `NoPairingFound` | No MaaSAuthPolicy + MaaSSubscription pair references it | Expected before §4.6. After §4.6, check `modelRefs[].name`/`namespace` match exactly |
+| `MaaSModelRef` Pending, `RuntimeReady=False` | Provider/Secret/endpoint problem | Fix §4.2–4.3 before touching governance |
 | `MaaSModelRef` not Ready | Namespace missing gateway-access label | `oc label namespace ${MODEL_NS} maas.opendatahub.io/gateway-access=true --overwrite` |
 | `404` from the gateway | `bedrock-runtime` instead of `bedrock-mantle` | Fix `spec.endpoint` |
 | `404`, endpoint correct | Model not on Mantle in that region | Re-check `/v1/models` |
+| `500 authType 'apikey' credentials not found` | Secret missing `inference.llm-d.ai/ipp-managed=true` — the documented `bbr-managed` label is inert | §4.2 |
+| `404` + Envoy `route_not_found` | HTTPRoute matches `targetModel`, pre-processing sends `modelName` | §4.5b |
+| `404` with `x-amzn-requestid` | Reached AWS with a bad path — used the namespaced URL | §4.5c: root path + model in body |
+| `503 UC,DC` on ~half of calls | One gateway replica serving stale config | Restart the gateway deployment (§4.7) |
+| `400 does not support the '/v1/chat/completions' API` | Wrong `apiFormat` for that model family | §4.5c |
 | `invalid_api_key` from AWS | **Truncated ABSK key (131 vs 132 chars)** | `oc get secret bedrock-api-key -n ${MODEL_NS} -o jsonpath='{.data.api-key}' \| base64 -d \| wc -c` → must be 132 |
 | `401` from AWS in IPP logs | Secret missing `bbr-managed` label or wrong data key | Label `inference.networking.k8s.io/bbr-managed=true`; key must be `api-key` |
 | `403` from the gateway | No matching `MaaSAuthPolicy` for caller's groups | Check `modelRefs` and `subjects` |
@@ -2507,6 +2786,8 @@ aws iam delete-service-specific-credential \
 [ ] §2.5(d) maas-default-gateway CREATED — class data-science-gateway-class, label-based allowedRoutes
 [ ] §2.5(e) MAAS_GW = https://maas.<cluster-domain>  (NOT rh-ai.<domain>)
 [ ] §2.5(f) ON-PREM ONLY: ConfigMap service:ClusterIP + passthrough Route; DNS for maas.<domain>
+[ ] §2.5 Listener hostname IS maas.<cluster-domain> (the UI hardcodes it — any other value breaks the console)
+[ ] §2.5 Gateway restarted after any listener/Service change, six-call loop clean
 [ ] §2.5 redhat-ods-applications labelled maas.opendatahub.io/gateway-access=true
 [ ] §2.6 PostgreSQL running; maas-db-config in redhat-ods-applications
 [ ] §2.7 DSC applied and Ready; dashboard reachable (both classic Route and $MAAS_GW)
@@ -2529,10 +2810,18 @@ aws iam delete-service-specific-credential \
 [ ] Secret bedrock-api-key: key=api-key, label bbr-managed=true, 132 bytes
 [ ] ExternalProvider bedrock-<region> (inference.opendatahub.io) created
 [ ] ExternalModel x2 (claude-sonnet, gpt-oss-20b) with apiFormat/path/targetModel
-[ ] MaaSModelRef x2 (maas.opendatahub.io) Ready
-[ ] MaaSAuthPolicy + two MaaSSubscriptions (standard + trial)
+[ ] HTTPRoutes Accepted=True, ResolvedRefs=True, both kuadrant.io/*Affected=True
+[ ] Inference path prefix recorded: /<model-ns>/<model-name>
+[ ] MaaSModelRef x2 created — Pending until §4.6 is applied (expected, not a fault)
+[ ] MaaSModelRef RuntimeReady=True (proves the provider connection works)
+[ ] MaaSAuthPolicy + two MaaSSubscriptions (standard + trial) — all PHASE Active
+[ ] MaaSModelRef now Ready with ENDPOINT populated
 [ ] OpenShift TOKEN available (oc whoami -t non-empty) — needed for the admin API
-[ ] Smoke test returns choices[]
+[ ] Secret labelled inference.llm-d.ai/ipp-managed=true (NOT bbr-managed)
+[ ] "Secret added/updated in store" confirmed in payload-processing logs
+[ ] HTTPRoute rule 3 header patched to modelName (§4.5b), survives 60s
+[ ] Inference via ${MAAS_GW}/v1/chat/completions with model in body → 200
+[ ] Six-call stability loop: all 200, ~1s each (no stale gateway replica)
 
 --- Part 5: guardrails ---
 [ ] trustyai Managed; GuardrailsOrchestrator CRD present
@@ -2878,3 +3167,128 @@ Fill this in once per environment, as you work through Part 2. Parts 4–6 read 
 | Kuadrant mTLS | off | |
 | IAM policy | `AmazonBedrockLimitedAccess` (not tightened — throwaway account) | |
 | Groups for auth policy / subscriptions | `system:authenticated` | |
+
+---
+
+# Appendix G — Undocumented 3.5 GA findings (bug report material)
+
+Discovered by trial and binary inspection on `rhods-operator.3.5.0` GA, MaaS v0.2.0, ai-gateway-operator 1.26.2, RHCL 1.4.2. **None of these appear in the product documentation.** Raise them with the RHOAI team.
+
+## 1. The Secret label is wrong in the docs
+
+| | |
+|---|---|
+| **Required** | `inference.llm-d.ai/ipp-managed=true` |
+| Documented (inert) | `inference.networking.k8s.io/bbr-managed=true` |
+
+`apikey-injection-secret-watcher` only caches Secrets carrying the first. With the documented label, every inference call returns:
+
+```
+HTTP 500  inference error: Internal - authType 'apikey' credentials not found
+```
+
+Silent: no RBAC error, no warning, no status condition. The `ExternalProvider` still reports `Ready`.
+
+**Evidence:** `grep -a '[a-zA-Z0-9.-]{0,20}/ipp-managed' /bbr` inside the payload-processing pod → `inference.llm-d.ai/ipp-managed`. Applying it produced `apikey-injection/reconciler.go:71 "Secret added/updated in store"` immediately, and the pipeline began completing with `apikey-injection/plugin.go:193 "auth headers injected"`.
+
+**Ruled out during diagnosis:** RBAC (ClusterRole `payload-processing-reader` grants full access to `inference.opendatahub.io` and Secrets; verified with the SA token from inside the pod); the `api-key` vs `apiKey` data-key name; placing the Secret in `openshift-ingress` or `models-as-a-service`; model-level `auth` overrides; IPP restarts.
+
+## 2. The generated HTTPRoute cannot match any request
+
+The controller sets the catch-all rule's `X-Gateway-Model-Name` header match to **`targetModel`**:
+
+```yaml
+- name: X-Gateway-Model-Name
+  value: openai.gpt-oss-20b          # targetModel
+```
+
+The pre-processing IPP sets that header from the request body's `model` field, which is **`modelName`**:
+
+```
+bodyfieldtoheader "parsed field from body" field=model value="bedrock-gpt-oss-20b"
+```
+
+They can never match → `404 route_not_found` at Envoy for every request. Manual patch (§4.5b) resolves it and survived reconciliation on the reference cluster.
+
+Note this bug is **masked** by bug 1: while credential injection aborts, IPP never rewrites the path, so Envoy's original path match holds and requests reach AWS. Fixing the label exposes the routing bug — which is why the symptom changed from 500 to 404 mid-diagnosis.
+
+## 3. `ExternalProvider` reports Ready without validating the credential
+
+`phase: Ready`, `"All resources created successfully"` — while the referenced Secret is invisible to the component that needs it. A condition reflecting whether the credential was actually loaded would have saved hours.
+
+## 4. Anthropic models on Bedrock Mantle: format unresolved
+
+`anthropic.claude-sonnet-5` with `apiFormat: openai-chat` returns:
+
+```json
+{"error":{"code":"validation_error",
+ "message":"The model 'anthropic.claude-sonnet-5' does not support the '/v1/chat/completions' API"}}
+```
+
+`apiFormat: messages` + `path: /v1/messages` returns 404 from AWS. Correct Mantle path for Anthropic-native format not determined. OpenAI-family models work.
+
+## 5. No rate-limit headers on responses
+
+HTTPRoute status shows `kuadrant.io/TokenRateLimitPolicyAffected: True` and `MaaSSubscription` is Active, but responses carry no `X-RateLimit-*` headers. Quota demos need the observability dashboard instead of response headers. Enforcement itself is untested at the limit.
+
+## 6. Two gateway replicas, one can hold stale config
+
+After changing the gateway Service type or listener hostname, one replica may serve stale upstream config: ~50% of calls return `503 UC,DC` after ~60s while the rest succeed in <1s. Distinguishable by pod IP in the Envoy access log. `oc rollout restart` fixes it. Worth an automatic reconcile.
+
+## 7. The MaaS hostname is NOT configurable in practice
+
+`AITenant.spec.gateway.name` lets you name the Gateway, and the Gateway listener hostname is yours to set — but **the MaaS UI hardcodes `maas.<cluster-domain>`**. It derives the API URL from the naming convention, not from the listener or from `MaaSModelRef.status.endpoint`.
+
+Set any other hostname and the API works perfectly via curl while the console breaks:
+
+```
+Error loading API keys
+unknown error when invoking maas-api (unmarshall): invalid character '<' looking for beginning of value
+```
+
+`maas-ui` logs show it plainly:
+
+```
+level=ERROR msg="unknown error when invoking maas-api (unmarshall)" statusCode=503
+  endpoint=https://maas.apps.<domain>/maas-api/v1/subscriptions
+```
+
+The `<` is the RHOAI dashboard's own HTML — the request fell through to a catch-all instead of reaching maas-api.
+
+**Consequence: the MaaS gateway listener hostname must be `maas.<cluster-domain>`.** Plan DNS around that at a customer site; it is not negotiable through configuration. Symptoms of getting it wrong are an entirely working API and a dead console — including empty **AI hub → Models** and a broken **Gen AI studio → API keys**.
+
+```bash
+oc logs -n redhat-ods-applications deployment/maas-ui --tail=30 | grep -i endpoint
+```
+
+## 8. Any gateway listener or Service change needs a manual restart
+
+Observed twice. After changing `spec.listeners[0].hostname`, or the Service type via the infrastructure ConfigMap (§2.5f), **one of the two gateway replicas keeps stale upstream config**. Roughly half of calls then return `503 UC,DC downstream_remote_disconnect` after a full ~60s timeout while the rest succeed in under a second.
+
+```bash
+oc rollout restart deployment/maas-default-gateway-data-science-gateway-class -n openshift-ingress
+oc rollout status deployment/maas-default-gateway-data-science-gateway-class -n openshift-ingress --timeout=300s
+```
+
+Make this a standing step after any gateway change, and always follow with the six-call loop. The gateway should reconcile this itself.
+
+## Diagnostic techniques worth reusing
+
+- **`grep -a` on the binary.** `strings` isn't in the image, but `grep -a` works and revealed the label. When docs and behaviour disagree, the binary is the source of truth.
+- **`x-amzn-requestid` distinguishes AWS from Envoy.** A 404 carrying it reached AWS; without it, check the Envoy log for `route_not_found`.
+- **Envoy access logs name the pod.** The second-to-last IP column identifies which gateway replica served a request — how the stale-replica issue was found.
+- **The SA token from inside the pod tests real RBAC.** `curl` against `kubernetes.default.svc` with `/var/run/secrets/kubernetes.io/serviceaccount/token` proves what the component can actually see, beyond `oc auth can-i`.
+- **Check the plugin chain in the IPP log.** `maas-headers-guard` → `model-provider-resolver` → `api-translation` → `apikey-injection` — whichever stage logs last is where it failed.
+
+## Verified working configuration
+
+```
+Client → ${MAAS_GW}/v1/chat/completions  {"model": "bedrock-gpt-oss-20b", ...}
+  ExternalProvider  provider=aws-bedrock  endpoint=bedrock-mantle.us-east-1.api.aws
+                    auth.type=apikey  secretRef=bedrock-api-key
+  Secret            data key "api-key"  label inference.llm-d.ai/ipp-managed=true
+  ExternalModel     modelName=bedrock-gpt-oss-20b  targetModel=openai.gpt-oss-20b
+                    apiFormat=openai-chat  path=/v1/chat/completions
+  HTTPRoute         rule[3] X-Gateway-Model-Name PATCHED to modelName
+  → HTTP 200, ~1s, usage.total_tokens reported
+```
