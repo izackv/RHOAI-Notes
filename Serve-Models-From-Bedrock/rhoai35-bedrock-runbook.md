@@ -68,11 +68,26 @@ The usual objection to orchestrator-in-front is that an analyst could bypass gua
 - Supported Configurations (per-component TP/GA status): `https://access.redhat.com/articles/rhoai-supported-configs-3.x`
 - Companion field guide (Kustomize + scripts): `https://rh-aiservices-bu.github.io/rhoai-maas-guide/`
 
+### Redaction policy for this document
+
+**This runbook is published in a public repository.** Environment-specific values must never appear in it.
+
+| Never write | Use instead |
+|---|---|
+| The real sandbox / cluster ID | `<sandbox-id>` — e.g. `apps.rhoai.<sandbox-id>.opentlc.com` |
+| Resolved IP addresses | `<gateway-ip>` |
+| AWS account IDs | `<account-id>` |
+| IAM credential IDs (`ACCA…`), user IDs (`AIDA…`) | `<credential-id>`, `<user-id>` |
+| ABSK keys, passwords, tokens | never, in any form |
+| ELB hostnames, internal cluster IPs | `<lb-hostname>`, `<cluster-ip>` |
+
+This applies to reference values, worked examples, and pasted command output alike — including the "Reference cluster" column of the Appendix F site record sheet. Site-specific values belong in *your* copy of Appendix F, which stays out of the repository.
+
 ### Working variables
 
 ```bash
 export CLUSTER_DOMAIN=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')
-export MAAS_GW="https://$(oc get gatewayconfig default-gateway -o jsonpath='{.status.domain}')"
+export MAAS_GW="https://maas.${CLUSTER_DOMAIN}"
 export AWS_REGION="us-east-1"
 export MODEL_NS="external-models"
 export TARGET_MODEL="openai.gpt-oss-20b"
@@ -427,136 +442,298 @@ Expect `prometheus-operator`, `prometheus-user-workload-0`, and `thanos-ruler-us
 
 **Console:** **Workloads → ConfigMaps**, project `openshift-monitoring`.
 
-## 2.5 Verify the platform Gateway — do NOT create one
+## 2.5 Gateways — verify the platform one, create the MaaS one
 
-**In RHOAI 3.5 GA the Gateway is created and owned by the platform.** Older guides (and earlier revisions of this runbook) tell you to build a `maas-default-gateway` by hand. That was correct for 3.4. It is wrong for 3.5 GA and will fight the operator.
+**RHOAI 3.5 GA uses TWO gateways.** This is the single most important structural fact in Part 2, and it is not in any guide.
 
-### What 3.5 GA creates for you
+| Gateway | Owner | Purpose | You |
+|---|---|---|---|
+| `data-science-gateway` | `GatewayConfig` (platform) | Dashboard, model catalog, notebooks, OAuth callback | **Verify only. Never edit** — the operator reconciles changes away. |
+| `maas-default-gateway` | **You** | All MaaS traffic: `maas-api`, model endpoints | **Create it.** MaaS will not, by design. |
 
-The DSCInitialization creates a `GatewayConfig` CR (`services.platform.opendatahub.io/v1alpha1`, named `default-gateway`), which in turn owns:
+MaaS refuses to provision until the second one exists. The `AITenant` controller says so explicitly:
 
-- the `GatewayClass` `data-science-gateway-class`
-- the `Gateway` `data-science-gateway` in `openshift-ingress`
-- an OpenShift Route exposing it externally
+```
+gateway openshift-ingress/maas-default-gateway not found:
+the Gateway must be created by a network or cluster administrator
+before AITenant can be provisioned
+```
+
+The name comes from `AITenant.spec.gateway.name`, which defaults to `maas-default-gateway`. It is a writable field, so you *could* point MaaS at `data-science-gateway` instead — **do not.** That Gateway is `GatewayConfig`-owned with a name-based namespace allowlist the platform controls, so admitting your model namespaces means fighting two controllers, and MaaS would need to add a listener to a Gateway it does not own.
+
+### (a) Verify the platform Gateway
 
 ```bash
-oc get gatewayconfig -A
-oc get gatewayclass
+oc get gatewayconfig default-gateway          # READY True
+oc get gatewayclass                           # data-science-gateway-class, ACCEPTED True
 oc get gateway -A
 oc get route -n openshift-ingress
 ```
 
-Expected on a healthy 3.5 GA cluster:
-
-| Resource | Expected |
-|---|---|
-| `gatewayconfig/default-gateway` | `phase: Ready`, `status.domain` populated |
-| `gatewayclass/data-science-gateway-class` | `ACCEPTED True` |
-| `gateway/data-science-gateway` | `PROGRAMMED True` in `openshift-ingress` |
-| Route in `openshift-ingress` | reencrypt route to the gateway service |
-
-### Derive your base URL from the cluster — never construct it
-
-```bash
-export MAAS_GW="https://$(oc get gatewayconfig default-gateway -o jsonpath='{.status.domain}')"
-echo "$MAAS_GW"
-```
-
-On the reference cluster this is `https://rh-ai.apps.<cluster-domain>` — note it is **not** `maas.<cluster-domain>`. The subdomain comes from `GatewayConfig`, is configurable via `spec.subdomain`/`spec.domain`, and will differ per site. Any guide (including older parts of this one) that hardcodes `maas.<domain>` is wrong.
-
-### Understand the namespace allowlist before Part 4
-
-This is the detail that decides whether your models are reachable.
-
-```bash
-oc get gateway data-science-gateway -n openshift-ingress -o jsonpath='{.spec.listeners}' | jq .
-```
-
-On the reference cluster the listener selects namespaces by **explicit name**, not by label:
-
-```yaml
-allowedRoutes:
-  namespaces:
-    from: Selector
-    selector:
-      matchExpressions:
-        - key: kubernetes.io/metadata.name
-          operator: In
-          values: [openshift-ingress, redhat-ods-applications]
-```
-
-**Consequence:** the `maas.opendatahub.io/gateway-access=true` label that 3.4-era guides tell you to apply does nothing against this Gateway. Your `external-models` namespace must appear in that allowlist by name.
-
-You cannot simply edit the Gateway — it has `ownerReferences` to `GatewayConfig` and the operator reconciles changes away. See §2.8 for how the MaaS component handles this.
-
-**Note the allowlist as it stands now**, before enabling MaaS — §2.8's discovery compares against this baseline to see whether the operator extends it for you. Capture it into the site record sheet (Appendix F):
-
-```bash
-oc get gateway data-science-gateway -n openshift-ingress \
-  -o jsonpath='{.spec.listeners[0].allowedRoutes.namespaces.selector}' | jq -c .
-```
-
-Reference cluster before §2.8: `openshift-ingress`, `redhat-ods-applications`.
-
-### `GatewayConfig` fields (for the customer build)
+The GatewayClass is created by the DSCI — you do not create one. Its name is `data-science-gateway-class`, **not** the `openshift-default` that generic Gateway API guides use; you need it for the MaaS Gateway below.
 
 `GatewayConfig.spec` governs identity and ingress plumbing, not routing:
 
 | Field | Purpose | Customer-site relevance |
 |---|---|---|
-| `certificate.type` | `SelfSigned` \| `Provided` \| `OpenshiftDefaultIngress` | Use `Provided` with `secretName` for a real corporate cert |
-| `domain` / `subdomain` | External hostname | Set explicitly if the default subdomain clashes with site DNS |
-| `ingressMode` | `OcpRoute` \| `LoadBalancer` | `OcpRoute` on sandbox/lab. `LoadBalancer` where a real LB is available |
-| `oidc` | `clientID`, `clientSecretRef`, `issuerURL` | **This is where you wire the customer's IdP** — Keycloak, Entra, Okta |
-| `enableK8sTokenValidation` | Accept OpenShift tokens | Keep `true` for `oc whoami -t` admin flows |
-| `authProxyTimeout`, `cookie.expire/refresh` | Session behaviour | Defaults are fine |
+| `certificate.type` | `SelfSigned` \| `Provided` \| `OpenshiftDefaultIngress` | Use `Provided` + `secretName` for a corporate cert |
+| `domain` / `subdomain` | Dashboard hostname | Set explicitly if the default clashes with site DNS |
+| `ingressMode` | `OcpRoute` \| `LoadBalancer` | `OcpRoute` on sandbox. Note this applies **only** to this Gateway |
+| `oidc` | `clientID`, `clientSecretRef`, `issuerURL` | **Where you wire the customer's IdP** |
+| `enableK8sTokenValidation` | Accept OpenShift tokens | Keep `true` |
 
-To change any of these, patch `GatewayConfig` — never the Gateway:
-
-```bash
-oc patch gatewayconfig default-gateway --type=merge -p '{"spec":{"subdomain":"maas"}}'
-oc get gatewayconfig default-gateway -o jsonpath='{.status.domain}{"\n"}'
-```
-
-> **`LoadBalancerReady: False` / `LoadBalancerPending` is normal** when `ingressMode: OcpRoute`. The Service stays ClusterIP and the Route provides external access. Do not chase this condition — check the Route works instead.
-
-### Verify external reachability
+Patch `GatewayConfig`, never the Gateway:
 
 ```bash
-oc get route -n openshift-ingress -o custom-columns='NAME:.metadata.name,HOST:.spec.host,SVC:.spec.to.name'
-curl -vsk "${MAAS_GW}" 2>&1 | grep -E "SSL connection|Connected|HTTP/"
+oc patch gatewayconfig default-gateway --type=merge -p '{"spec":{"subdomain":"rh-ai"}}'
 ```
 
-Reference output at this stage:
+> `LoadBalancerReady: False` on `data-science-gateway` is **normal** with `ingressMode: OcpRoute` — the Service stays ClusterIP and a Route provides access. Do not chase it.
 
+### (b) Find the ingress certificate
+
+```bash
+export CLUSTER_DOMAIN=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')
+export CERT_NAME=$(oc get ingresscontroller default -n openshift-ingress-operator \
+  -o jsonpath='{.spec.defaultCertificate.name}' 2>/dev/null)
+export CERT_NAME="${CERT_NAME:-router-certs-default}"
+echo "domain=$CLUSTER_DOMAIN cert=$CERT_NAME"
+
+oc get secret -n openshift-ingress | grep -iE 'cert|tls'
 ```
-* Connected to rh-ai.apps.<domain> (18.207.170.116) port 443
-* SSL connection using TLSv1.3 / AEAD-CHACHA20-POLY1305-SHA256
-< HTTP/1.1 404 Not Found
+
+`spec.defaultCertificate` is **empty** when no custom certificate is configured — that is normal, and the operator-generated wildcard `router-certs-default` in `openshift-ingress` is what you use. Confirm it appears in the secret list before continuing. At a customer site this is where their real wildcard secret goes, and `-k` disappears from every curl in this runbook.
+
+### (c) Memory override
+
+Istio's 1Gi default is not enough once Kuadrant compiles its Wasm extensions, and the gateway pod gets OOMKilled under load — an intermittent failure that is miserable to diagnose mid-demo.
+
+```bash
+cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maas-gateway-options
+  namespace: openshift-ingress
+data:
+  deployment: |
+    spec:
+      template:
+        spec:
+          containers:
+            - name: istio-proxy
+              resources:
+                limits:
+                  memory: 2Gi
+EOF
 ```
 
-**404 is the expected and correct result.** You are testing three things — DNS resolves to a real address, TLS terminates, and the Route reaches the Gateway. All three passed. The 404 is the Gateway correctly reporting that no HTTPRoute matches `/`, because MaaS endpoints do not exist until §2.8.
+### (d) Create the MaaS Gateway
 
-| Response to `curl "${MAAS_GW}"` | Meaning |
+```bash
+cat <<EOF | oc apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: maas-default-gateway
+  namespace: openshift-ingress
+  annotations:
+    opendatahub.io/managed: "false"
+    security.opendatahub.io/authorino-tls-bootstrap: "true"
+spec:
+  gatewayClassName: data-science-gateway-class
+  infrastructure:
+    parametersRef:
+      group: ""
+      kind: ConfigMap
+      name: maas-gateway-options
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "maas.${CLUSTER_DOMAIN}"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            group: ""
+            name: ${CERT_NAME}
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              maas.opendatahub.io/gateway-access: "true"
+EOF
+
+oc wait --for=condition=Programmed gateway/maas-default-gateway -n openshift-ingress --timeout=180s
+```
+
+**Four things here are load-bearing:**
+
+| Item | Why |
 |---|---|
-| **404** | Correct at this stage. Gateway is live, no routes match `/` yet. |
-| 403, or a redirect to a login page | Also fine — some configurations put the auth proxy in front of the catch-all |
-| `Could not resolve host` | DNS/Route problem — check `oc get route -n openshift-ingress` |
-| `Connection refused` / timeout | Gateway pod not running, or `ingressMode` mismatch — check `oc get pods -n openshift-ingress` |
-| TLS handshake failure | Certificate problem — check `gatewayconfig.spec.certificate` and the listener's `certificateRefs` |
+| `name: maas-default-gateway` | Must match `AITenant.spec.gateway.name`. MaaS looks for this exact name in `openshift-ingress`. |
+| `gatewayClassName: data-science-gateway-class` | The RHOAI-created class. `openshift-default` does not exist here. |
+| `opendatahub.io/managed: "false"` | Lets maas-controller own the AuthPolicies; without it the ODH Model Controller overwrites them |
+| `allowedRoutes` **by label** | Deliberately different from `data-science-gateway`'s name-based allowlist. MaaS does **not** overwrite this, so `maas.opendatahub.io/gateway-access=true` is how model namespaces get admitted in §4.1. |
 
-Do **not** try to make `/` return 200. It has no route and is not supposed to.
-
-### Fallback: no Gateway was created
-
-If `oc get gatewayconfig -A` returns nothing, the DSCI has not reconciled. Do not hand-build a Gateway — fix the DSCI:
+### (e) Verify
 
 ```bash
-oc get dscinitialization default-dsci -o yaml | yq '.status'
-oc logs -n redhat-ods-operator deployment/rhods-operator --tail=100 | grep -i gateway
+oc get gateway -A
+oc get svc -n openshift-ingress | grep -i maas
 ```
 
-The manual Gateway procedure is preserved in **Appendix D** for 3.4-era clusters and for the case where a site genuinely needs a second, separately-managed gateway. Do not use it on 3.5 GA unless §2.8 discovery shows the operator does not wire MaaS in.
+Reference result — note this Gateway gets a **real LoadBalancer**, because `ingressMode: OcpRoute` applies only to the GatewayConfig-managed Gateway:
+
+```
+data-science-gateway   ...svc.cluster.local                      True   (ClusterIP + Route)
+maas-default-gateway   <lb-hostname>.us-east-1.elb.amazonaws.com True   (LoadBalancer)
+```
+
+Set your base URL and test:
+
+```bash
+export MAAS_GW="https://maas.${CLUSTER_DOMAIN}"     # LoadBalancer path; on a Route see §2.5(f)
+echo "$MAAS_GW"
+
+dig +short maas.${CLUSTER_DOMAIN}
+curl -sk -o /dev/null -w "%{http_code}\n" "${MAAS_GW}/maas-api/health"
+```
+
+**Before §2.8 this returns 404 or a connection error — that is expected**, since `maas-api` does not exist yet. After §2.8 it must return **200**.
+
+> **`MAAS_GW` is `maas.<cluster-domain>`, not the dashboard host.** Do not reuse `gatewayconfig status.domain` (`rh-ai.<domain>`) — that is the *dashboard* gateway. Requests for `/maas-api/*` sent there hit the dashboard's catch-all `/` route and return the dashboard's HTML with status 200, which looks like success. Record `MAAS_GW` in Appendix F.
+>
+> If `dig` returns nothing, the cluster's wildcard DNS does not cover `maas.<domain>`. On the reference sandbox it resolved without extra work. Otherwise add a DNS record for the ELB hostname, or create a passthrough Route.
+
+### (f) On-prem / non-cloud: ClusterIP + Route
+
+**On a cloud cluster the Gateway provisions a LoadBalancer automatically.** On-prem there is no cloud LB controller, so a `LoadBalancer` Service sits `Pending` forever and nothing reaches the gateway. Use ClusterIP plus an OpenShift Route instead.
+
+This is the **verified** procedure — tested on the reference cloud cluster by forcing it down the on-prem path.
+
+```bash
+# Snapshot for rollback
+oc get configmap maas-gateway-options -n openshift-ingress -o yaml > /tmp/maas-gw-options-backup.yaml
+
+# The infrastructure ConfigMap accepts a `service` key alongside `deployment`
+oc patch configmap maas-gateway-options -n openshift-ingress --type=merge -p '{
+  "data": {"service": "spec:\n  type: ClusterIP\n"}}'
+
+oc rollout restart deployment -n openshift-ingress \
+  -l gateway.networking.k8s.io/gateway-name=maas-default-gateway
+sleep 30
+oc get svc -n openshift-ingress | grep maas       # TYPE must now read ClusterIP
+```
+
+Then expose it with a **passthrough** Route:
+
+```bash
+oc create route passthrough maas-gateway -n openshift-ingress \
+  --service=maas-default-gateway-data-science-gateway-class \
+  --port=443 --hostname="maas.${CLUSTER_DOMAIN}"
+
+oc get route maas-gateway -n openshift-ingress
+curl -sk "https://maas.${CLUSTER_DOMAIN}/maas-api/health"; echo
+```
+
+> **Passthrough, not reencrypt.** The gateway already terminates TLS with a certificate valid for `*.apps.<domain>`, so re-encrypting at the router adds a hop and a trust relationship to get wrong. Reencrypt was tested here and failed — the router could not validate the backend certificate. Passthrough lets SNI carry the hostname straight to Envoy.
+>
+> `data-science-gateway` uses reencrypt, but its backend presents a `service-ca`-signed certificate the router already trusts. Yours does not.
+
+**If the health check is empty or fails, check DNS before anything else:**
+
+```bash
+curl -vk "https://maas.${CLUSTER_DOMAIN}/maas-api/health" 2>&1 | tail -20
+dig +short maas.${CLUSTER_DOMAIN}
+dig +short anything-random.${CLUSTER_DOMAIN}     # does the wildcard work at all?
+```
+
+`Could not resolve host` is a DNS problem, not a Route problem. Prove the topology independently by bypassing the resolver:
+
+```bash
+ROUTER_IP=$(dig +short console-openshift-console.${CLUSTER_DOMAIN} | head -1)
+curl -sk --resolve "maas.${CLUSTER_DOMAIN}:443:${ROUTER_IP}" \
+  "https://maas.${CLUSTER_DOMAIN}/maas-api/health"; echo
+```
+
+`{"status":"healthy"}` here means the gateway, Route, and MaaS are all correct and **only DNS is outstanding** — on-prem that is a DNS ticket, not a technical blocker. Either the customer's `*.apps` wildcard already covers it, or their DNS admin adds `maas.<domain>` → ingress VIP.
+
+#### Gotcha: switching an existing cloud gateway from LoadBalancer to ClusterIP
+
+Only affects clusters that ran with a LoadBalancer first — a fresh on-prem build never hits this.
+
+When the ELB existed, external-dns published a record for `maas.<domain>`. Removing the ELB leaves the **name registered but empty**, and an explicit record always shadows the wildcard. The signature:
+
+```
+dig maas.<domain>
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: ...
+;; flags: qr rd ra; QUERY: 1, ANSWER: 0, AUTHORITY: 1
+```
+
+**`NOERROR` with `ANSWER: 0`** — the name exists, has no address. Distinguish it from a broken wildcard:
+
+```bash
+dig +short anything-random.${CLUSTER_DOMAIN}    # wildcard healthy → returns router IPs
+dig +short maas.${CLUSTER_DOMAIN}               # shadowed → returns nothing
+```
+
+Cache flushing does not help; a public resolver returns the same. **Use a different hostname** the wildcard covers and external-dns never claimed:
+
+```bash
+export MAAS_HOSTNAME="maas-gw.${CLUSTER_DOMAIN}"
+dig +short ${MAAS_HOSTNAME}        # must return the router IPs
+
+oc patch gateway maas-default-gateway -n openshift-ingress --type=json \
+  -p "[{\"op\":\"replace\",\"path\":\"/spec/listeners/0/hostname\",\"value\":\"${MAAS_HOSTNAME}\"}]"
+
+oc delete route maas-gateway -n openshift-ingress
+oc create route passthrough maas-gateway -n openshift-ingress \
+  --service=maas-default-gateway-data-science-gateway-class \
+  --port=443 --hostname="${MAAS_HOSTNAME}"
+
+export MAAS_GW="https://${MAAS_HOSTNAME}"
+curl -sk "${MAAS_GW}/maas-api/health"; echo
+```
+
+> **The Gateway listener hostname and the Route hostname must match.** With passthrough, SNI carries the hostname to Envoy, which matches its listener on it. A mismatch produces an empty response with no error — indistinguishable from the DNS failure above.
+>
+> Changing the hostname breaks nothing else: `AITenant` references the Gateway by **name**, not hostname. Only `MAAS_GW` changes, and everything downstream reads that variable.
+
+#### Read MAAS_GW from the cluster, never construct it
+
+Once you are on a Route, the hostname is whatever the Route says — not a formula:
+
+```bash
+export MAAS_GW="https://$(oc get route maas-gateway -n openshift-ingress -o jsonpath='{.spec.host}')"
+echo "$MAAS_GW"
+curl -sk "${MAAS_GW}/maas-api/health"; echo
+```
+
+Reference cluster after the on-prem switch: `https://maas-gw.apps.rhoai.<sandbox-id>.opentlc.com`. Record it in Appendix F — Parts 4, 5 and 6 all read it.
+
+**Rollback to LoadBalancer:**
+
+```bash
+oc patch configmap maas-gateway-options -n openshift-ingress --type=json \
+  -p '[{"op":"remove","path":"/data/service"}]'
+oc rollout restart deployment -n openshift-ingress \
+  -l gateway.networking.k8s.io/gateway-name=maas-default-gateway
+oc delete route maas-gateway -n openshift-ingress
+```
+
+**Alternative — MetalLB.** Keeps the manifest identical to §2.5(d), but needs MetalLB installed, an IPAddressPool on a free IP in the node subnet (**not** a node's own IP), *and* a DNS record for `maas.<domain>` pointing at that VIP — the `*.apps` wildcard points at the ingress VIP, not your new one. Two extra dependencies and a DNS ticket versus zero. Prefer ClusterIP + Route unless the customer specifically wants MaaS off the ingress path.
+
+### Label namespaces that attach routes
+
+```bash
+oc label namespace redhat-ods-applications maas.opendatahub.io/gateway-access=true --overwrite
+```
+
+`external-models` gets this label in §4.1 and the guardrails namespace in §5.2. **Without it the Gateway silently rejects the HTTPRoute** — no error, no event, the model just never becomes reachable.
+
 ## 2.6 PostgreSQL for maas-api
 
 `maas-api` stores hashed API keys, subscription bindings, expiry, and revocation state. **Create this before §2.8 or `maas-api` crash-loops.**
@@ -686,6 +863,9 @@ oc apply -f dsc.yaml
 oc get dsc -w        # wait for READY True, then Ctrl-C
 ```
 
+**Console alternative to `oc apply -f dsc.yaml`:** this is the *OpenShift* console (not the RHOAI dashboard) — **Administration → CustomResourceDefinitions → DataScienceCluster → Instances → Create DataScienceCluster**, YAML view, paste the manifest above. The masthead **+** → **Import YAML** does the same thing in one step.
+
+
 **Choices worth knowing:**
 
 - **`llamastackoperator: Removed`** — GenAI Studio playground. Set Managed if you want a built-in chat UI for the demo; it is not required for anything else here.
@@ -731,15 +911,85 @@ oc get pods -n redhat-ods-applications | grep -E 'notebook|workbench'
 
 An empty imagestream list means images are still importing — wait a few minutes.
 
-**Create it (console):**
+#### 3.5 GA dashboard navigation
+
+The nav was renamed in 3.5 — **"Data Science Projects" is now just "Projects"**. Any guide referencing the old label is 2.x-era. The 3.5 GA left nav is:
+
+```
+Home
+Projects                  ← workbenches live here
+AI hub
+Learning resources
+Applications              → Enabled | Explore
+Settings                  → Cluster settings
+                            Environment setup
+                            Model resources and operations
+                            User management
+```
+
+#### Option A — console
 
 1. Open the dashboard and log in
-2. **Data Science Projects → Create project** → `bedrock-demo`
-3. **Workbenches → Create workbench**
-   - Image: **Standard Data Science** — it has `pip`, which §6.2 needs for the `openai` package
-   - Container size: **Small**
-   - Storage: **Create new persistent storage**, 20Gi (uses the default StorageClass)
-4. Create
+2. **Projects** in the left nav → **Create project** → name it `bedrock-demo`
+3. Open the project → **Workbenches** tab → **Create workbench**
+4. Work down the form's left-hand steps:
+
+| Step | What to set |
+|---|---|
+| **Name and description** | `bedrock-demo-wb` |
+| **Workbench image** | `Jupyter \| Data Science \| CPU \| Python 3.12`, **Version selection: 3.5** (Python v3.12). Images are versioned in 3.5 — take the newest. |
+| **Deployment size** | **Hardware profile: `default-profile`** — 2 CPU / 4 GiB. **Take the default; do not customize.** Ample for a notebook that pip-installs `openai` and makes HTTPS calls. |
+| **Environment variables** | Skip. §6.2 pastes the MaaS key into the notebook. *(For a polished demo you could inject it from a Secret here instead.)* |
+| **Cluster storage** | 20 GiB on the default StorageClass — usually prefilled |
+| **Connections** | Skip. This is for S3/model connections; there are none in this scenario. |
+
+5. **Create**
+
+> **"Container size: Small" no longer exists.** 3.5 replaced the T-shirt size dropdown with **Hardware profiles**. `default-profile` gives 2 CPU / 4 GiB, customizable to 4 CPU / 8 GiB. Any guide offering Small/Medium/Large is 2.x-era.
+
+#### Choosing the workbench image
+
+3.5 renamed the images to a `Product | Variant | Accelerator | Python` scheme. **"Standard Data Science" no longer exists** — any guide naming it is 2.x-era. List what your cluster actually offers:
+
+```bash
+oc get imagestream -n redhat-ods-applications \
+  -o custom-columns='NAME:.metadata.name,DISPLAY:.metadata.annotations.opendatahub\.io/notebook-image-name' \
+  | sort
+```
+
+| Use | Display name | Imagestream |
+|---|---|---|
+| **Default for this runbook** | `Jupyter \| Data Science \| CPU \| Python 3.12` | `s2i-generic-data-science-notebook` |
+| Smaller/faster alternative | `Jupyter \| Minimal \| CPU \| Python 3.12` | `s2i-minimal-notebook` |
+| Part 5 guardrails work | `Jupyter \| TrustyAI \| CPU \| Python 3.12` | `odh-trustyai-notebook` |
+| VS Code instead of Jupyter | `Code Server \| Data Science \| CPU \| Python 3.12` | `code-server-notebook` |
+
+**Requirements are modest:** Python 3.x with `pip`, CPU-only. §6.2 installs the `openai` package and makes HTTPS calls — that is the entire workload.
+
+**Avoid anything containing CUDA, ROCm, or Gaudi.** There is nothing to schedule against on a GPU-less cluster, they pull many GB for no benefit, and accelerator variants can sit Pending waiting for resources that do not exist.
+
+> The `runtime-*` imagestreams with no display name are **pipeline runtimes, not workbench images**. They will not appear in the workbench picker. Ignore them.
+
+> There is also a **Start basic workbench** button at the top right of the Projects page, which spins one up without creating a project. Fine for a quick check, but create the project — §6.2 and the demo narrative both assume it.
+
+#### Option B — CLI
+
+An RHOAI project is an ordinary namespace carrying the dashboard label. Without that label it exists in OpenShift but **will not appear in the dashboard**:
+
+```bash
+oc new-project bedrock-demo 2>/dev/null || oc project bedrock-demo
+oc label namespace bedrock-demo opendatahub.io/dashboard=true --overwrite
+
+oc get namespace bedrock-demo --show-labels | grep opendatahub.io/dashboard
+```
+
+Reload the dashboard and it appears under **Projects**.
+
+> **If a project you created is missing from the list**, check two things: the `opendatahub.io/dashboard=true` label, and the **A.I. projects** filter chip at the top of the Projects page — an active filter will hide unlabelled or non-matching namespaces. Click **Clear all filters** to rule it out.
+
+Creating the workbench itself from the CLI means writing a `Notebook` CR, which is fiddly and version-sensitive. Create the project with the CLI if you prefer, then use the console for the workbench.
+
+**Watch it start:**
 
 ```bash
 oc get pods -n bedrock-demo -w
@@ -763,127 +1013,193 @@ Python version plus `200` confirms the notebook runs **and has egress** — whic
 | Workbench stuck Pending | No default StorageClass, or PVC unbound — `oc get pvc -n bedrock-demo` |
 | ImagePullBackOff | Imagestreams still importing, or a pull-secret problem |
 | No images offered in the form | Imagestreams not yet imported — wait and reload |
+| Project missing from the dashboard | Namespace lacks `opendatahub.io/dashboard=true`, or an active filter chip on the Projects page |
 | Notebook starts, `requests` call hangs | Egress blocked. Resolve before §6.2 |
 
-**Console:** **Administration → CustomResourceDefinitions → DataScienceCluster → Instances → Create DataScienceCluster** (YAML view), or masthead **+** → **Import YAML**.
 
-## 2.8 Enable MaaS, then discover how it wired itself
+## 2.8 Enable MaaS
 
-Everything MaaS needs now exists: Authorino, Limitador, the platform Gateway, PostgreSQL, and a healthy RHOAI.
+Everything MaaS needs now exists: Authorino, Limitador, **the `maas-default-gateway`**, PostgreSQL, and a healthy RHOAI.
 
 ### The field path (changed in 3.5 GA)
 
-`kserve.modelsAsService` is **deprecated** — preserved for backward compatibility through at least 3.6, and one-directional: CEL allows `Managed→Removed` but blocks `Removed→Managed`. You cannot fall back to it.
-
-The live path is:
+`kserve.modelsAsService` is **deprecated** — kept for compatibility through at least 3.6, and one-directional: CEL allows `Managed→Removed` but blocks `Removed→Managed`. You cannot fall back to it.
 
 ```
 spec.components.aigateway.managementState: Managed
 spec.components.aigateway.modelsAsAService.managementState: Managed
 ```
 
-**Spelling: `modelsAsAService` — "AsA".** The CRD documents this as intentional, matching the `ai-gateway-operator` CRD's own `spec.modelsAsAService`. A misspelling is silently ignored, not rejected.
-
-Confirm against your cluster before patching:
+**Spelling: `modelsAsAService` — "AsA".** Intentional, matching the `ai-gateway-operator` CRD's own field. A misspelling is silently ignored, not rejected.
 
 ```bash
 oc explain datasciencecluster.spec.components.aigateway.modelsAsAService
-```
 
-### Apply
-
-```bash
 oc patch datasciencecluster default-dsc --type=merge -p '{
   "spec": {"components": {"aigateway": {
     "managementState": "Managed",
     "modelsAsAService": {"managementState": "Managed"}
   }}}}'
+
+oc get dsc -w      # back to READY True, then Ctrl-C
+
+# Confirm BOTH fields landed — a merge patch can silently drop the nested one
+oc get dsc default-dsc -o jsonpath='{.spec.components.aigateway}'; echo
 ```
 
-**Console:** **CustomResourceDefinitions → DataScienceCluster → default-dsc → YAML**, edit `spec.components.aigateway`, Save.
+### What gets created, and where
 
-### Discovery block — run this every time, at every site
+Namespaces are **not** what 3.4 guides describe. Nothing lands in `redhat-ods-applications` except controllers.
 
-MaaS is a first-class platform component in 3.5 GA: the CRD `modelsasservices.components.platform.opendatahub.io` sits alongside `kserves`, `dashboards`, and `workbenches`, and the operator manages its own wiring. **What it wires up is what you build Part 4 on top of**, so inspect rather than assume. Wait ~2 minutes after the patch, then:
+| Resource | Namespace | Note |
+|---|---|---|
+| `AIGateway/default-aigateway` | cluster-scoped | Parent component CR. `oc get modelsasservice` returns nothing — MaaS is a *sub-component*, not its own CR |
+| `ai-gateway-operator`, `maas-controller` | `redhat-ods-applications` | Controllers |
+| **`maas-api`** | **`redhat-ai-gateway-infra`** | The API itself. ClusterIP :8443 + HTTPRoute `maas-api-route`. **Not** in `redhat-ods-applications` |
+| `AITenant/models-as-a-service` | `ai-tenants` | Holds `spec.gateway.name` |
+| `MaasTenantConfig/default-tenant` | `models-as-a-service` | API-key expiry + telemetry settings |
+| `Config/default` | cluster-scoped | `limitadorScrapeInterval`, `usageLogging` |
+
+### Verify
 
 ```bash
-echo "=== 1. Component CR ==="
-oc get modelsasservice -A
-oc get modelsasservice -A -o yaml | yq '.items[].status'
+oc get dsc default-dsc -o jsonpath='{.status.conditions}' | python3 -m json.tool \
+  | grep -A3 -E 'AIGatewayReady|ModelsAsAServiceReady'
 
-echo -e "\n=== 2. Did the Gateway change? ==="
-oc get gateway data-science-gateway -n openshift-ingress -o jsonpath='{.spec.listeners}' | jq .
+oc get aigateway -A                       # default-aigateway  READY True
+oc get aitenant -A                        # READY True, GATEWAY maas-default-gateway
+oc get maastenantconfig -A                # READY True, REASON Reconciled
+oc get pods -n redhat-ai-gateway-infra    # maas-api 1/1 Running
+oc get httproute -A | grep -i maas        # maas-api-route
 
-echo -e "\n=== 3. New routes / hostnames ==="
-oc get httproute -A
-oc get route -A | grep -iE 'maas|gateway|rh-ai'
-
-echo -e "\n=== 4. Payload processor — external models need this ==="
-oc get pods -n openshift-ingress
-
-echo -e "\n=== 5. MaaS CRDs and API ==="
-oc get crd | grep -E 'maas|aigateway'
-oc get deployment maas-api -n redhat-ods-applications
-oc get crd | grep -i tenant
-oc get tenant,aitenant,maastenantconfig -A 2>/dev/null
-
-echo -e "\n=== 6. Health ==="
-export MAAS_GW="https://$(oc get gatewayconfig default-gateway -o jsonpath='{.status.domain}')"
-echo "MAAS_GW=$MAAS_GW"
-curl -sk "${MAAS_GW}/maas-api/health"
+curl -sk "${MAAS_GW}/maas-api/health"; echo
 ```
 
-### How to read the results
+`ModelsAsAServiceReady` should read *"modelsAsAService is Managed and deployments are available"*, and the health check must return **200**.
 
-| Question | Result | What to do |
-|---|---|---|
-| **Namespace allowlist** — did the listener's `matchExpressions` values grow? | New namespaces appeared | The operator manages the allowlist. Find how to declare `external-models`: `oc explain modelsasservice.spec --recursive` |
-| | Unchanged | You must add `external-models` yourself — via `ModelsAsService` spec if it has such a field, else via `GatewayConfig`. **Never edit the Gateway directly.** |
-| **Listener** — was a MaaS-specific listener added? | Yes, new hostname | Use that hostname as `MAAS_GW` |
-| | No | MaaS shares the existing listener; endpoints live under paths on `$MAAS_GW` |
-| **Payload processor** — pod in `openshift-ingress`? | Running | Good — external models will work |
-| | Absent | **Stop.** External models cannot work. Check `oc get modelsasservice -A -o yaml` status conditions and the operator log |
-| **`maas-api`** | `1/1` Available | Proceed |
-| | CrashLoopBackOff | Almost always the database — see the table below |
-| **Health endpoint** | `{"status":"healthy"}` | Part 2 complete |
-| | 404 | Wrong base URL — re-derive from `gatewayconfig` `status.domain`, and check whether MaaS uses a different path prefix |
-| | 503 | `maas-api` not ready yet; wait and retry |
-| **Tenant resource** | `Tenant`, or `AITenant`/`MaasTenantConfig` | Record which; 3.5 GA may use either. `Ready=False` with `DeploymentsNotReady` is **expected** until a model is registered in Part 4 |
-
-**Record the answers in Appendix F.** Parts 4–6 depend on four values: `MAAS_GW`, the model path prefix, the namespace admission mechanism, and the tenant CRD kind.
-
-### If `maas-api` crash-loops
+### If the tenant stays Pending / Failed
 
 ```bash
-oc logs -n redhat-ods-applications deployment/maas-api --tail=100
+oc get aitenant -A -o yaml | grep -A8 'conditions:'
+oc logs -n redhat-ods-applications deployment/maas-controller --tail=40
 ```
 
-| Log symptom | Cause | Fix |
+| Condition / log | Cause | Fix |
 |---|---|---|
-| `secret "maas-db-config" not found` | Wrong namespace | Must be `redhat-ods-applications`, not `opendatahub` |
-| `connection refused` / `dial tcp` | Postgres unreachable | Check service DNS and that `maas-postgres` is Running |
-| `password authentication failed` | Wrong credentials | Recreate the secret, then `oc rollout restart deployment/maas-api -n redhat-ods-applications` |
-| Pod never appears | DSC not reconciled | `oc describe dsc default-dsc`; `oc logs -n redhat-ods-operator deployment/rhods-operator --tail=100` |
+| `GatewayCheckFailed` / `GatewayNotReady`, *"gateway openshift-ingress/maas-default-gateway not found"* | The MaaS Gateway does not exist | §2.5(d). This is by design — MaaS never creates it |
+| Gateway exists but name differs | `AITenant.spec.gateway.name` mismatch | `oc get aitenant -A -o jsonpath='{.items[0].spec.gateway.name}'` and match it |
+| `maas-api` CrashLoopBackOff | Database | `oc logs -n redhat-ai-gateway-infra deployment/maas-api --tail=100` — see §2.6 |
+| Health returns dashboard HTML | Called the wrong gateway | `MAAS_GW` must be `maas.<domain>`, not `rh-ai.<domain>` |
+| `oc get modelsasservice` empty | Not an error | MaaS is a sub-component of `AIGateway`. Use `oc get aigateway -A` |
+
+> **`maas-api` logs every request with an `auth_headers` field** — `Authorization=absent X-Api-Key=absent Cookie=absent ...`. That is the header-stripping evidence used in §6.5, available with no extra setup.
+
+### Record in Appendix F
+
+`MAAS_GW`, the tenant CRD kinds (`AITenant` + `MaasTenantConfig`), the infra namespace (`redhat-ai-gateway-infra`), and confirmation that namespace admission is **label-based** on this Gateway.
+
 ## 2.9 Dashboard feature flags
 
-Turns on the MaaS tabs in the RHOAI console.
+3.5 stripped `OdhDashboardConfig.spec.dashboardConfig` down to almost nothing — on a fresh install it contains only `disableTracking`. The CRD describes the field as *"intended to just contain overrides"*, so anything unset takes a default, and the MaaS-related features default to **off**.
+
+### Inspect first
+
+```bash
+oc get odhdashboardconfig odh-dashboard-config -n redhat-ods-applications \
+  -o jsonpath='{.spec.dashboardConfig}' | python3 -m json.tool
+
+# Every flag your version accepts — do not trust any doc's list, including this one
+oc explain odhdashboardconfig.spec.dashboardConfig --recursive
+
+# Deprecated flags, which CEL will reject on write
+oc get crd odhdashboardconfigs.opendatahub.io -o yaml | grep -i -B2 -A6 'DEPRECATED'
+```
+
+3.5 offers roughly 60 flags. The ones relevant here:
+
+| Flag | Enables | Needed for |
+|---|---|---|
+| `modelAsService` | Models-as-a-Service UI | Part 4 |
+| **`externalModels`** | **External model management UI** | **Part 4 — easy to miss** |
+| **`guardrails`** | **Guardrails UI** | **Part 5** |
+| `observabilityDashboard` | Token metering / observability | §6.3 |
+| `genAiStudio` | GenAI Studio playground | Only if `llamastackoperator: Managed` |
+| `vLLMDeploymentOnMaaS` | Deploy vLLM models through MaaS | Not needed for Bedrock. Relevant if the customer wants on-prem and external models behind one gateway |
+
+### Apply
 
 ```bash
 oc patch odhdashboardconfig odh-dashboard-config \
   -n redhat-ods-applications --type=merge \
   -p '{"spec":{"dashboardConfig":{
         "modelAsService": true,
-        "maasAuthPolicies": true,
+        "externalModels": true,
+        "guardrails": true,
         "observabilityDashboard": true
       }}}'
 
 oc get odhdashboardconfig odh-dashboard-config -n redhat-ods-applications \
-  -o jsonpath='{.spec.dashboardConfig}' | jq .
+  -o jsonpath='{.spec.dashboardConfig}' | python3 -m json.tool
 ```
 
-Add `"genAiStudio": true` only if you set `llamastackoperator: Managed` in §2.7.
+> **Do NOT include `maasAuthPolicies`.** It exists in the schema but is **deprecated in 3.5**, and a CEL rule rejects any attempt to set it:
+>
+> ```
+> Invalid value: "object": no such key: maasAuthPolicies evaluating rule:
+> DEPRECATED: spec.dashboardConfig.maasAuthPolicies must be removed or left unchanged.
+> ```
+>
+> The patch is rejected **atomically** — one deprecated field means none of the others apply, and `oc get` still shows the old content. Same one-directional CEL pattern as `kserve.modelsAsService` (§2.8).
 
-**Console:** **CustomResourceDefinitions → OdhDashboardConfig → odh-dashboard-config → YAML.**
+If a patch is rejected and you cannot tell which field caused it, bisect:
+
+```bash
+for f in modelAsService externalModels guardrails observabilityDashboard; do
+  printf "%-24s " "$f"
+  oc patch odhdashboardconfig odh-dashboard-config -n redhat-ods-applications \
+    --type=merge -p "{\"spec\":{\"dashboardConfig\":{\"$f\":true}}}" >/dev/null 2>&1 \
+    && echo OK || echo REJECTED
+done
+```
+
+### Verify
+
+**Hard-reload the dashboard** (Cmd/Ctrl-Shift-R) — the UI is built from micro-frontends (`agentOps`, `evalHub`, `genAi`, `maas`, `modelRegistry`) that cache aggressively, so a normal refresh may not pick up flag changes.
+
+The nav grows as components and flags are enabled. Reference cluster, before and after:
+
+```
+Before §2.8/§2.9          After §2.9 + hard reload
+─────────────────────     ────────────────────────────────
+Home                      Home
+Projects                  Projects
+AI hub                    AI hub
+                            └─ Models              ← externalModels
+Learning resources        Gen AI studio
+Applications                └─ API keys            ← modelAsService
+Settings                  Learning resources
+                          Applications
+                          Settings
+                            ├─ Cluster settings
+                            ├─ Environment setup
+                            ├─ Model resources and operations
+                            ├─ User management
+                            └─ MaaS governance     ← modelAsService
+```
+
+**MaaS is not one menu — it is three, split by function.** Expect this question from anyone using the UI:
+
+| Task | Where |
+|---|---|
+| Register / view models, incl. external | **AI hub → Models** |
+| Mint and revoke MaaS API keys | **Gen AI studio → API keys** |
+| Auth policies, subscriptions, quotas | **Settings → MaaS governance** |
+
+That gives Parts 4 and 6 a console path as well as the curl commands — **Gen AI studio → API keys** is the UI equivalent of the `POST /maas-api/v1/api-keys` call in §4.6, and is the better option when demoing to a non-technical audience.
+
+**Console:** **Administration → CustomResourceDefinitions → OdhDashboardConfig → odh-dashboard-config → YAML** (the OpenShift console, not the RHOAI dashboard).
+
+> The operator recreates this resource with factory defaults if deleted, but does not overwrite edits to existing fields.
 
 ## 2.10 Part 2 exit criteria
 
@@ -893,14 +1209,16 @@ Do not start Part 4 until all of these pass:
 oc get csv -n openshift-operators | grep rhcl              # v1.4.2+ Succeeded
 oc get pods -n kuadrant-system                             # authorino + limitador Running
 oc get pods -n openshift-user-workload-monitoring          # prometheus-user-workload-0 Running
-oc get gatewayconfig default-gateway                       # phase Ready, status.domain set
-oc get gateway data-science-gateway -n openshift-ingress   # PROGRAMMED=True, has ADDRESS
+oc get gatewayconfig default-gateway                       # READY True
+oc get gateway -A                                          # BOTH gateways PROGRAMMED=True
+oc get aitenant -A                                         # READY True
+oc get maastenantconfig -A                                 # READY True, Reconciled
+oc get pods -n redhat-ai-gateway-infra                     # maas-api 1/1, has ADDRESS
 oc get secret maas-db-config -n redhat-ods-applications    # exists
 oc get dsc default-dsc                                     # READY True
 oc get crd | grep maas.opendatahub.io                      # MaaS CRDs present
-oc get deployment maas-api -n redhat-ods-applications      # 1/1
 oc get pods -n openshift-ingress -l app=payload-processing # 1/1 Running
-curl -sk "${MAAS_GW}/maas-api/health"                      # healthy
+curl -sk "${MAAS_GW}/maas-api/health"                      # 200 (MAAS_GW = maas.<domain>)
 ```
 
 ---
@@ -1205,9 +1523,81 @@ If the key validates but calls still fail, work down this ladder. Each step rule
 
 # PART 4 — Wire Bedrock into RHOAI
 
-Part 2 built the gateway. Part 3 proved the AWS credential. Now you attach one to the other.
+Part 2 built the gateway. Part 3 proved the AWS credential. Now you connect them.
 
-Nothing here deploys a model. You are registering an external endpoint and declaring who may call it and how much.
+Nothing here deploys a model. You register an external endpoint and declare who may call it and how much.
+
+## 4.0 The 3.5 GA object model
+
+**This changed completely from 3.4.** The flat `ExternalModel` with `provider`/`endpoint`/`targetModel`/`credentialRef` no longer exists. 3.5 splits connection from presentation:
+
+```
+ExternalProvider  (inference.opendatahub.io)   WHERE + HOW to connect
+  endpoint: bedrock-mantle.us-east-1.api.aws        FQDN only, no scheme/path
+  provider: aws-bedrock                             API type
+  auth: {type: apikey, secretRef: {name: ...}}      credential
+        │
+        │ referenced by name, same namespace
+        ▼
+ExternalModel  (inference.opendatahub.io)      WHAT clients ask for
+  modelName: bedrock-claude-sonnet                  name clients use
+  externalProviderRefs:                             ARRAY — one model, many providers
+    - ref: {name: bedrock-us-east-1}
+      apiFormat: openai-chat                        translation
+      path: /v1/chat/completions                    outgoing :path
+      targetModel: anthropic.claude-sonnet-5        provider's own model id
+      weight: 100                                   traffic split
+        │
+        ▼
+MaaSModelRef  (maas.opendatahub.io)            EXPOSE through the MaaS gateway
+  modelRef: {kind: ExternalModel, name: ...}
+```
+
+Then `MaaSAuthPolicy` (who) and `MaaSSubscription` (how much), both in `models-as-a-service`.
+
+**Verify the schema on your cluster before applying anything:**
+
+```bash
+oc get crd | grep inference.opendatahub.io
+# externalmodels.inference.opendatahub.io
+# externalproviders.inference.opendatahub.io
+
+oc explain externalprovider.spec --recursive
+oc explain externalmodel.spec --recursive
+oc explain maasmodelref.spec --recursive
+```
+
+> **Two `externalmodels` CRDs exist.** `externalmodels.inference.opendatahub.io` is the live one; `externalmodels.maas.opendatahub.io` is legacy — the same deprecated-but-present pattern as `tenants` vs `aitenants`. If a command is ambiguous, fully qualify it: `oc get externalmodels.inference.opendatahub.io`.
+
+**Why the split matters for the customer story:** because `externalProviderRefs` is an array with `weight`, one client-facing model name can fan out across several providers — the same model in two regions, or a canary between vendors — with no client change. That is the "provider portability" claim made concrete.
+
+### Field reference
+
+**ExternalProvider**
+
+| Field | Notes |
+|---|---|
+| `endpoint` (req) | **FQDN only — no scheme, no path.** e.g. `bedrock-mantle.us-east-1.api.aws` |
+| `provider` (req) | API type: `openai`, `anthropic`, `azure`, `aws-bedrock`, `vertex` |
+| `auth.type` (req) | `apikey` \| `simple` \| `sigv4` \| `oauth2` |
+| `auth.secretRef.name` (req) | Secret in the **same namespace**, data key **`api-key`** |
+| `config` | Provider-specific k/v, e.g. Vertex `{"project": "...", "location": "..."}` |
+
+**ExternalModel**
+
+| Field | Notes |
+|---|---|
+| `modelName` | Name clients use. Defaults to `metadata.name` |
+| `externalProviderRefs[].ref.name` (req) | ExternalProvider, same namespace |
+| `externalProviderRefs[].apiFormat` (req) | `openai-chat` (`/v1/chat/completions`) or `messages` (Anthropic `/v1/messages`) |
+| `externalProviderRefs[].path` (req) | Outgoing `:path` pseudo-header. Supports `{key}` placeholders from the merged config |
+| `externalProviderRefs[].targetModel` (req) | The provider's own model id |
+| `externalProviderRefs[].weight` | Traffic split across refs |
+| `externalProviderRefs[].config` | Overrides the provider's config for this binding |
+
+> **`path` is per-binding and templated**, which is what makes odd providers work. The 3.4 translator hardcoded `/v1/chat/completions`, so Google Gemini (which needs `/v1beta/openai/chat/completions`) simply 404'd. In 3.5 you set `path` and it works.
+>
+> **`auth.type: sigv4`** suggests native AWS SigV4 signing is supported, which would remove the long-lived ABSK key entirely. Not validated here — this runbook uses `apikey`, which is proven. Worth investigating for a production customer build, since "no long-lived AWS credential in the cluster" is a materially better security posture.
 
 ## 4.1 Namespace
 
@@ -1215,38 +1605,24 @@ Nothing here deploys a model. You are registering an external endpoint and decla
 export MODEL_NS="external-models"
 oc create namespace ${MODEL_NS} --dry-run=client -o yaml | oc apply -f -
 
-# Apply the label — harmless, and required if your Gateway selects by label
+# REQUIRED — maas-default-gateway admits namespaces BY LABEL
 oc label namespace ${MODEL_NS} maas.opendatahub.io/gateway-access=true --overwrite
 
 oc get namespace ${MODEL_NS} --show-labels
-
-# CRITICAL on 3.5 GA: the platform Gateway may select namespaces by NAME, not label.
-# Confirm external-models is admitted before going further:
-oc get gateway data-science-gateway -n openshift-ingress -o jsonpath='{.spec.listeners}' | jq .
 ```
 
-**Console:** **Home → Projects → Create Project**, then **Administration → Namespaces →** select → **Edit labels**.
-
-> No error is raised if the namespace is not admitted. The `MaaSModelRef` simply never reaches Ready and the endpoint 404s. **This is the first thing to check when anything in Part 4 fails.**
->
-> On 3.5 GA the reference cluster's Gateway used `matchExpressions` on `kubernetes.io/metadata.name` — an explicit namespace-name allowlist. The label does nothing there. Use the mechanism you recorded in §2.8 discovery.
+> The label is genuinely load-bearing here. `maas-default-gateway` (§2.5d) uses label-based `allowedRoutes`, unlike `data-science-gateway`'s name-based allowlist. Without it the Gateway **silently** rejects the HTTPRoute — no error, no event, the model just never becomes reachable. Check this first whenever anything in Part 4 fails.
 
 ## 4.2 Credential Secret
 
-Three requirements, all mandatory:
+Three requirements: same namespace as the `ExternalProvider`, data key exactly **`api-key`** (mandated by the CRD), and the bbr-managed label.
 
-1. Same namespace as the `ExternalModel`
-2. Data key exactly `api-key`
-3. Label `inference.networking.k8s.io/bbr-managed=true`
-
-**Re-validate the key before it goes in.** A truncated key stored in a Secret surfaces later as an opaque 401 from AWS buried in payload-processor logs — far more expensive to diagnose here than in §3.5.
+**Re-validate the key first.** A truncated key stored in a Secret surfaces later as an opaque 401 from AWS buried in payload-processor logs.
 
 ```bash
 echo "len=${#BEDROCK_API_KEY} prefix=${BEDROCK_API_KEY:0:4}"
 # len=132 prefix=ABSK  — anything else, go back to §3.5
-```
 
-```bash
 oc create secret generic bedrock-api-key \
   --from-literal=api-key="${BEDROCK_API_KEY}" \
   -n ${MODEL_NS} --dry-run=client -o yaml | oc apply -f -
@@ -1254,30 +1630,107 @@ oc create secret generic bedrock-api-key \
 oc label secret bedrock-api-key -n ${MODEL_NS} \
   inference.networking.k8s.io/bbr-managed=true --overwrite
 
-oc get secret bedrock-api-key -n ${MODEL_NS} --show-labels
 oc get secret bedrock-api-key -n ${MODEL_NS} -o jsonpath='{.data.api-key}' | base64 -d | wc -c
 # 132
 ```
 
 **Console:** **Workloads → Secrets → Create → Key/value secret** in `external-models`. Name `bedrock-api-key`, key `api-key`. Then **Actions → Edit labels**.
 
-> Never commit this to Git. For GitOps, use External Secrets Operator or Sealed Secrets. The `ExternalModel` CR itself is safe to commit — it holds only a `credentialRef`.
+> Never commit this. For GitOps use External Secrets Operator or Sealed Secrets — the `ExternalProvider` CR itself is safe to commit, holding only a `secretRef`.
 
-## 4.3 ExternalModel + MaaSModelRef
+## 4.3 ExternalProvider
+
+One provider serves every Bedrock model in the region.
 
 ```bash
 cat <<EOF | oc apply -f -
-apiVersion: maas.opendatahub.io/v1alpha1
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalProvider
+metadata:
+  name: bedrock-${AWS_REGION}
+  namespace: ${MODEL_NS}
+spec:
+  provider: aws-bedrock
+  endpoint: bedrock-mantle.${AWS_REGION}.api.aws
+  auth:
+    type: apikey
+    secretRef:
+      name: bedrock-api-key
+EOF
+
+oc get externalprovider -n ${MODEL_NS}
+oc describe externalprovider bedrock-${AWS_REGION} -n ${MODEL_NS}
+```
+
+**Use `bedrock-mantle.<region>.api.aws`, not `bedrock-runtime`.** Only Mantle serves `/v1/chat/completions`; `bedrock-runtime` uses an `/openai/v1/` prefix and returns 404 for the path set below.
+
+## 4.4 ExternalModels
+
+Two models — you need a second for the model-swap demo in §6.2.
+
+```bash
+cat <<EOF | oc apply -f -
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalModel
+metadata:
+  name: bedrock-claude-sonnet
+  namespace: ${MODEL_NS}
+spec:
+  modelName: bedrock-claude-sonnet
+  externalProviderRefs:
+    - ref:
+        name: bedrock-${AWS_REGION}
+      apiFormat: openai-chat
+      path: /v1/chat/completions
+      targetModel: anthropic.claude-sonnet-5
+      weight: 100
+---
+apiVersion: inference.opendatahub.io/v1alpha1
 kind: ExternalModel
 metadata:
   name: bedrock-gpt-oss-20b
   namespace: ${MODEL_NS}
 spec:
-  provider: bedrock-openai
-  targetModel: ${TARGET_MODEL}
-  endpoint: bedrock-mantle.${AWS_REGION}.api.aws
-  credentialRef:
-    name: bedrock-api-key
+  modelName: bedrock-gpt-oss-20b
+  externalProviderRefs:
+    - ref:
+        name: bedrock-${AWS_REGION}
+      apiFormat: openai-chat
+      path: /v1/chat/completions
+      targetModel: openai.gpt-oss-20b
+      weight: 100
+EOF
+
+oc get externalmodels.inference.opendatahub.io -n ${MODEL_NS}
+```
+
+Confirm the target model ids are available in your region first:
+
+```bash
+curl -s "https://bedrock-mantle.${AWS_REGION}.api.aws/v1/models" \
+  -H "Authorization: Bearer ${BEDROCK_API_KEY}" \
+  | jq -r '.data[] | select(.status=="available") | .id' | sort
+```
+
+> **Model choice for the demo.** `gpt-oss-20b` is a reasoning model — reasoning tokens count against `max_tokens` and against your metering, so the analyst sees three words while chargeback shows hundreds of tokens. That muddies the metering story. Use `anthropic.claude-sonnet-5` or `anthropic.claude-haiku-4-5` for anything customer-facing; keep `gpt-oss-20b` for cheap plumbing tests.
+>
+> Both models here use `apiFormat: openai-chat` because Bedrock Mantle presents an OpenAI-compatible API even for Anthropic models. Use `messages` only against the Anthropic API directly.
+
+## 4.5 MaaSModelRef
+
+Exposes each model through the MaaS gateway.
+
+```bash
+cat <<EOF | oc apply -f -
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSModelRef
+metadata:
+  name: bedrock-claude-sonnet
+  namespace: ${MODEL_NS}
+spec:
+  modelRef:
+    kind: ExternalModel
+    name: bedrock-claude-sonnet
 ---
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: MaaSModelRef
@@ -1289,93 +1742,32 @@ spec:
     kind: ExternalModel
     name: bedrock-gpt-oss-20b
 EOF
+
+oc get maasmodelref -n ${MODEL_NS}
 ```
 
-Check the API version against your cluster first, since 3.5 GA moved other MaaS fields:
-
-```bash
-oc get crd externalmodels.maas.opendatahub.io -o jsonpath='{.spec.versions[*].name}{"\n"}'
-oc explain externalmodel.spec
-```
-
-If `oc explain externalmodel.spec` shows `provider`, `endpoint`, `targetModel`, `credentialRef`, the YAML above is correct as written.
-
-### Field reference
-
-| Field | Value | Notes |
-|---|---|---|
-| `spec.provider` | `bedrock-openai` | Selects the BBR translator. Others: `openai`, `anthropic`, `azure-openai`, `vertex-openai` |
-| `spec.endpoint` | `bedrock-mantle.us-east-1.api.aws` | **Hostname only — no scheme, no path.** |
-| `spec.targetModel` | `openai.gpt-oss-20b` | Exactly as returned by `/v1/models` |
-| `spec.credentialRef.name` | `bedrock-api-key` | Same namespace |
-
-For `bedrock-openai` the translator is **pass-through** — no body translation, auth via `Authorization: Bearer`. This is why Bedrock-via-Mantle is the cleanest external provider to integrate.
-
-### What the reconciler creates
-
-`Service` (ExternalName) · `ServiceEntry` · `DestinationRule` (TLS origination) · `HTTPRoute`
+`modelRef.kind` accepts `ExternalModel` or `LLMInferenceService` — the latter is how you would expose an on-prem vLLM model through the same gateway. Optional fields: `endpointOverride` and `tenantRef` (defaults to the single tenant).
 
 ### Verify
 
 ```bash
-oc get externalmodel,maasmodelref -n ${MODEL_NS}
+oc get externalprovider,externalmodels.inference.opendatahub.io,maasmodelref -n ${MODEL_NS}
+oc get httproute -n ${MODEL_NS}
+oc get serviceentry,destinationrule -n ${MODEL_NS} 2>/dev/null
+oc logs -n openshift-ingress -l app=payload-processing --tail=40
 ```
 
-Want `PHASE: Ready` with an ENDPOINT, HTTPROUTE, and GATEWAY populated. If not:
+If a `MaaSModelRef` will not go Ready:
 
 ```bash
-oc describe externalmodel bedrock-gpt-oss-20b -n ${MODEL_NS}
-oc describe maasmodelref bedrock-gpt-oss-20b -n ${MODEL_NS}
-oc get httproute,serviceentry,destinationrule -n ${MODEL_NS}
+oc describe maasmodelref bedrock-claude-sonnet -n ${MODEL_NS}
+oc describe externalmodels.inference.opendatahub.io bedrock-claude-sonnet -n ${MODEL_NS}
+oc get namespace ${MODEL_NS} --show-labels | grep gateway-access   # the usual culprit
 ```
 
-**Console:** **CustomResourceDefinitions** → search `ExternalModel` → **Instances → Create**. Or masthead **+** → **Import YAML** and paste both documents at once.
+## 4.6 Access policy and quota
 
-## 4.4 Add a second model
-
-Demo 2 is "swap models without touching the client." That needs at least two. Anthropic Claude through Bedrock is the compelling one — same commercial relationship, no separate vendor contract:
-
-```bash
-cat <<EOF | oc apply -f -
-apiVersion: maas.opendatahub.io/v1alpha1
-kind: ExternalModel
-metadata:
-  name: bedrock-claude-sonnet
-  namespace: ${MODEL_NS}
-spec:
-  provider: bedrock-openai
-  targetModel: anthropic.claude-sonnet-5
-  endpoint: bedrock-mantle.${AWS_REGION}.api.aws
-  credentialRef:
-    name: bedrock-api-key
----
-apiVersion: maas.opendatahub.io/v1alpha1
-kind: MaaSModelRef
-metadata:
-  name: bedrock-claude-sonnet
-  namespace: ${MODEL_NS}
-spec:
-  modelRef:
-    kind: ExternalModel
-    name: bedrock-claude-sonnet
-EOF
-```
-
-Confirm the model ID is available in your region first:
-
-```bash
-curl -s "https://bedrock-mantle.${AWS_REGION}.api.aws/v1/models" \
-  -H "Authorization: Bearer ${BEDROCK_API_KEY}" \
-  | jq -r '.data[] | select(.status=="available") | .id' | sort
-```
-
-> **Model choice for the demo.** `gpt-oss-20b` is a reasoning model — it emits reasoning tokens that count against `max_tokens` and against your metering. The analyst sees three words and the chargeback report shows hundreds of tokens, which muddies the metering story. Use `anthropic.claude-sonnet-5` or `anthropic.claude-haiku-4-5` for anything customer-facing; keep `gpt-oss-20b` for cheap plumbing tests.
-
-## 4.5 Access policy and quota
-
-These live in the **`models-as-a-service`** namespace, not the model namespace.
-
-Two subscription tiers make the quota story visible — a generous one for the demo and a deliberately tiny one you can exhaust live.
+These live in **`models-as-a-service`**, not the model namespace. Two tiers, so §6.3 can exhaust one on camera.
 
 ```bash
 cat <<EOF | oc apply -f -
@@ -1386,13 +1778,16 @@ metadata:
   namespace: models-as-a-service
 spec:
   modelRefs:
-    - name: bedrock-gpt-oss-20b
-      namespace: ${MODEL_NS}
     - name: bedrock-claude-sonnet
+      namespace: ${MODEL_NS}
+    - name: bedrock-gpt-oss-20b
       namespace: ${MODEL_NS}
   subjects:
     groups:
       - name: "system:authenticated"
+  meteringMetadata:
+    costCenter: "demo-cc"
+    organizationId: "demo-org"
 ---
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: MaaSSubscription
@@ -1403,13 +1798,17 @@ spec:
   owner:
     groups:
       - name: "system:authenticated"
+  priority: 100
+  tokenMetadata:
+    costCenter: "analysts"
+    organizationId: "demo-org"
   modelRefs:
-    - name: bedrock-gpt-oss-20b
+    - name: bedrock-claude-sonnet
       namespace: ${MODEL_NS}
       tokenRateLimits:
         - limit: 100000
           window: "1h"
-    - name: bedrock-claude-sonnet
+    - name: bedrock-gpt-oss-20b
       namespace: ${MODEL_NS}
       tokenRateLimits:
         - limit: 100000
@@ -1424,6 +1823,7 @@ spec:
   owner:
     groups:
       - name: "system:authenticated"
+  priority: 10
   modelRefs:
     - name: bedrock-gpt-oss-20b
       namespace: ${MODEL_NS}
@@ -1435,23 +1835,46 @@ EOF
 oc get maasauthpolicy,maassubscription -n models-as-a-service
 ```
 
-- **`MaaSAuthPolicy`** — *who may call this model*. Enforced by Authorino.
-- **`MaaSSubscription`** — *how many tokens they get*. Enforced by Limitador.
+- **`MaaSAuthPolicy`** — *who may call*. Enforced by Authorino.
+- **`MaaSSubscription`** — *how many tokens*. Enforced by Limitador.
 
-For the real engagement, replace `system:authenticated` with actual OpenShift or OIDC groups and create one subscription per department. That is the chargeback boundary.
+**Three 3.5 fields that make the chargeback story concrete:**
 
-**Console:** RHOAI dashboard → **Models as a Service** offers a subscription form with a *Create matching authorization policy* checkbox. Otherwise **Import YAML**.
+| Field | Use |
+|---|---|
+| `tokenMetadata` / `meteringMetadata` — `costCenter`, `organizationId`, `labels` | Tags every metered call. This is what turns raw token counts into a finance-department report. |
+| `modelRefs[].billingRate.perToken` | Attaches a price to tokens, so the dashboard shows cost, not just usage |
+| `priority` | QoS ordering between subscriptions under contention |
 
-## 4.6 Smoke test
+For the real engagement, replace `system:authenticated` with actual OpenShift or OIDC groups and create one subscription per department with its own `costCenter`. That is the chargeback boundary and the thing the customer is actually buying.
+
+**Console:** **Settings → MaaS governance** (enabled in §2.9) manages policies and subscriptions.
+
+## 4.7 Smoke test
 
 ```bash
-export MAAS_GW="https://$(oc get gatewayconfig default-gateway -o jsonpath='{.status.domain}')"
+# LoadBalancer gateway: maas.<cluster-domain>. On a Route (§2.5f), read it from the Route:
+export MAAS_GW="https://$(oc get route maas-gateway -n openshift-ingress -o jsonpath='{.spec.host}' 2>/dev/null || echo "maas.$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')")"
+echo "MAAS_GW=$MAAS_GW"
+curl -sk "${MAAS_GW}/maas-api/health"; echo    # {"status":"healthy"}
+```
 
-# Model appears in the catalog
+You need an OpenShift **token** to call the MaaS admin API — the gateway sits behind `kube-auth-proxy`, so certificate-based kubeconfig auth is not enough:
+
+```bash
+oc whoami -t || echo "no token — log in with one"
+# If empty: oc login -u <user> -p <password> --server=https://api.<cluster>:6443
+# or console top-right → Copy login command → Display Token
+```
+
+> **Two different credentials, easy to confuse.** The OpenShift token authenticates *you* to the MaaS admin API. The MaaS API key it returns is what an *analyst* uses to call models. You need the first to create the second.
+
+```bash
+# Catalog
 curl -sk "${MAAS_GW}/maas-api/v1/models" \
   -H "Authorization: Bearer $(oc whoami -t)" | jq -r '.data[].id'
 
-# Mint an API key
+# Mint an analyst key
 API_KEY=$(curl -sk -X POST "${MAAS_GW}/maas-api/v1/api-keys" \
   -H "Authorization: Bearer $(oc whoami -t)" -H "Content-Type: application/json" \
   -d '{"name":"demo-key","subscription":"analysts-standard","expiresIn":"24h"}' | jq -r '.key')
@@ -1463,13 +1886,11 @@ curl -sk "${MAAS_GW}/${MODEL_NS}/bedrock-claude-sonnet/v1/chat/completions" \
   -d '{"model":"bedrock-claude-sonnet","messages":[{"role":"user","content":"Say hello in 3 words."}],"max_tokens":300}' | jq .
 ```
 
-Path structure: `https://maas.<domain>/<model-namespace>/<model-name>/v1/chat/completions`
+**Console alternative:** **Gen AI studio → API keys** mints and revokes keys in the UI — better for a non-technical audience than curl.
 
-> **`max_tokens` generously — 300, not 20.** Reasoning models spend the budget on reasoning tokens and return `finish_reason: "length"` with `content: null`, which looks like a broken integration but is only a truncated answer. If `usage.completion_tokens` equals your `max_tokens`, that is what happened.
+> `max_tokens` generously — **300, not 20**. Reasoning models spend the budget on reasoning tokens and return `finish_reason: "length"` with `content: null`, which looks broken but is only truncated. If `usage.completion_tokens` equals your `max_tokens`, that is what happened.
 
-Save the key — Part 5 and Part 6 use it.
-
----
+Save the key — Parts 5 and 6 use it. Record `MAAS_GW` and the model path prefix in Appendix F.
 
 # PART 5 — Guardrails
 
@@ -1523,7 +1944,7 @@ The orchestrator reads a ConfigMap describing its generator (upstream LLM) and i
 
 ```bash
 # Upstream host = the MaaS gateway host, WITHOUT the https:// scheme
-export MAAS_HOST=$(oc get gatewayconfig default-gateway -o jsonpath='{.status.domain}')
+export MAAS_HOST="maas.${CLUSTER_DOMAIN}"
 echo "orchestrator will call: $MAAS_HOST"
 
 cat <<EOF | oc apply -f -
@@ -1815,7 +2236,7 @@ curl -sk "${MAAS_GW}/maas-api/health"
 
 This is the strongest opener: it looks exactly like what the analysts already do.
 
-**Use the workbench created in §2.7.** If you skipped that smoke test, create it now: RHOAI dashboard → **Data Science Projects → Create project** (`bedrock-demo`) → **Workbenches → Create workbench**. Image *Standard Data Science*, size Small, 20Gi storage.
+**Use the workbench created in §2.7.** If you skipped that smoke test, create it now: RHOAI dashboard → **Projects** → **Create project** (`bedrock-demo`) → open it → **Workbenches → Create workbench**. Image `Jupyter | Data Science | CPU | Python 3.12`, hardware profile `default-profile`, 20 GiB storage. (3.5 renamed the nav item, the images, and replaced container sizes with hardware profiles.)
 
 ```bash
 oc get pods -n bedrock-demo    # notebook pod Running
@@ -1990,10 +2411,17 @@ oc label secret bedrock-api-key -n ${MODEL_NS} inference.networking.k8s.io/bbr-m
 | `403` from the gateway | No matching `MaaSAuthPolicy` for caller's groups | Check `modelRefs` and `subjects` |
 | `429` unexpectedly | Subscription limit too low | Raise `tokenRateLimits.limit` |
 | `content: null`, `finish_reason: length` | Reasoning model exhausted `max_tokens` — not a failure | Raise to 300+ |
-| No Gateway at all | DSCI not reconciled | Fix the DSCI — do NOT hand-build a Gateway on 3.5 GA (§2.5) |
+| AITenant `GatewayCheckFailed` | `maas-default-gateway` missing — MaaS never creates it | §2.5(d) |
+| `maas-api` not found in `redhat-ods-applications` | Wrong namespace — it lives in `redhat-ai-gateway-infra` | `oc get pods -n redhat-ai-gateway-infra` |
+| `/maas-api/health` returns dashboard HTML at 200 | Called `rh-ai.<domain>` instead of `maas.<domain>` | Dashboard's `/` catch-all swallows unknown paths (§2.5e) |
+| `oc get modelsasservice` empty | Not an error — MaaS is a sub-component of AIGateway | `oc get aigateway -A` |
+| Dashboard patch rejected: "DEPRECATED ... must be removed or left unchanged" | A deprecated flag (e.g. `maasAuthPolicies`) in the patch | Remove it. Rejection is atomic — no field applies (§2.9) |
+| Flags set but nav unchanged | Micro-frontend cache | Hard-reload (Cmd/Ctrl-Shift-R) |
 | Gateway edits keep reverting | Gateway is owned by `GatewayConfig` | Patch `gatewayconfig/default-gateway`, never the Gateway (§2.5) |
 | `LoadBalancerReady: False` | Normal with `ingressMode: OcpRoute` | Ignore; verify the Route instead (§2.5) |
-| 404 on `/maas-api/health` | Base URL constructed, not derived | `export MAAS_GW="https://$(oc get gatewayconfig default-gateway -o jsonpath='{.status.domain}')"` |
+| Empty response from `$MAAS_GW`, no error | Gateway listener hostname != Route hostname (passthrough/SNI) | Make them match (§2.5f) |
+| `dig` shows NOERROR with ANSWER: 0 | Stale explicit DNS record shadowing the wildcard | Use a different hostname (§2.5f) |
+| 404 on `/maas-api/health` | Base URL constructed, not derived | `export MAAS_GW="https://maas.${CLUSTER_DOMAIN}"` |
 | HTTPRoute never attaches | Namespace not in the Gateway's name-based allowlist | Label-based access does NOT apply on 3.5 GA — see §2.8 discovery |
 | `maas-api` CrashLoopBackOff | Postgres unreachable or secret missing | §2.6, §2.8 |
 | No MaaS CRDs | `aigateway`/`modelsAsAService` not Managed | §2.8 — note the **AsA** spelling |
@@ -2073,16 +2501,23 @@ aws iam delete-service-specific-credential \
 [ ] §2.3 (b) File verified in-container: ls shows service-ca-bundle.crt, head shows BEGIN CERTIFICATE
 [ ] §2.3 (c) SSL_CERT_FILE + REQUESTS_CA_BUNDLE set on the Deployment and still present after rollout
 [ ] §2.4 User Workload Monitoring enabled
-[ ] §2.5 GatewayConfig Ready; data-science-gateway Programmed (platform-created — do NOT build one)
-[ ] §2.5 MAAS_GW derived from gatewayconfig status.domain (NOT maas.<domain>)
-[ ] §2.5 Namespace allowlist mechanism recorded (name-based matchExpressions on reference cluster)
+[ ] §2.5(a) GatewayConfig READY; data-science-gateway Programmed (platform-owned — never edit)
+[ ] §2.5(b) CERT_NAME resolved (router-certs-default when defaultCertificate is empty)
+[ ] §2.5(c) maas-gateway-options ConfigMap (2Gi) applied
+[ ] §2.5(d) maas-default-gateway CREATED — class data-science-gateway-class, label-based allowedRoutes
+[ ] §2.5(e) MAAS_GW = https://maas.<cluster-domain>  (NOT rh-ai.<domain>)
+[ ] §2.5(f) ON-PREM ONLY: ConfigMap service:ClusterIP + passthrough Route; DNS for maas.<domain>
+[ ] §2.5 redhat-ods-applications labelled maas.opendatahub.io/gateway-access=true
 [ ] §2.6 PostgreSQL running; maas-db-config in redhat-ods-applications
 [ ] §2.7 DSC applied and Ready; dashboard reachable (both classic Route and $MAAS_GW)
 [ ] §2.7 Workbench smoke test passed — notebook runs AND has egress (reused in §6.2)
 [ ] §2.8 aigateway + modelsAsAService Managed  (spelling: AsA)
-[ ] §2.8 Discovery block run; four values recorded (MAAS_GW, path prefix, ns admission, tenant kind)
-[ ] §2.8 MaaS CRDs present; maas-api 1/1; IPP 1/1; /maas-api/health healthy
-[ ] §2.9 Dashboard flags set
+[ ] §2.8 Both fields confirmed present in spec.components.aigateway
+[ ] §2.8 AIGateway/AITenant/MaasTenantConfig all READY True
+[ ] §2.8 maas-api 1/1 in redhat-ai-gateway-infra; /maas-api/health returns 200
+[ ] §2.9 Dashboard flags set: modelAsService, externalModels, guardrails, observabilityDashboard
+[ ]      (NOT maasAuthPolicies — deprecated, CEL rejects the whole patch)
+[ ] §2.9 Hard-reloaded; nav shows AI hub>Models, Gen AI studio>API keys, Settings>MaaS governance
 
 --- Part 3: AWS ---
 [x] ABSK key validated: len=132, prefix=ABSK
@@ -2092,9 +2527,11 @@ aws iam delete-service-specific-credential \
 --- Part 4: integration ---
 [ ] external-models namespace labelled gateway-access=true
 [ ] Secret bedrock-api-key: key=api-key, label bbr-managed=true, 132 bytes
-[ ] ExternalModel + MaaSModelRef for gpt-oss-20b — PHASE Ready
-[ ] ExternalModel + MaaSModelRef for claude-sonnet-5 — PHASE Ready
-[ ] MaaSAuthPolicy + two MaaSSubscriptions
+[ ] ExternalProvider bedrock-<region> (inference.opendatahub.io) created
+[ ] ExternalModel x2 (claude-sonnet, gpt-oss-20b) with apiFormat/path/targetModel
+[ ] MaaSModelRef x2 (maas.opendatahub.io) Ready
+[ ] MaaSAuthPolicy + two MaaSSubscriptions (standard + trial)
+[ ] OpenShift TOKEN available (oc whoami -t non-empty) — needed for the admin API
 [ ] Smoke test returns choices[]
 
 --- Part 5: guardrails ---
@@ -2118,22 +2555,26 @@ aws iam delete-service-specific-credential \
 
 ---
 
-# Appendix B — Provider matrix
+# Appendix B — Provider matrix (3.5 schema)
 
-| Provider | `spec.provider` | Endpoint | Translation | Auth header |
-|---|---|---|---|---|
-| AWS Bedrock | `bedrock-openai` | `bedrock-mantle.<region>.api.aws` | Pass-through | `Authorization: Bearer` |
-| OpenAI | `openai` | `api.openai.com` | Pass-through | `Authorization: Bearer` |
-| Anthropic | `anthropic` | `api.anthropic.com` | OpenAI ↔ Messages API | `x-api-key` |
-| Azure OpenAI | `azure-openai` | `<resource>.openai.azure.com` | Path rewrite + field stripping | `api-key` |
-| Vertex AI | `vertex-openai` | `<region>-aiplatform.googleapis.com` | Path rewrite + field stripping | `Authorization: Bearer` (OAuth) |
+`ExternalProvider.spec.provider` names the API type; `ExternalModel.spec.externalProviderRefs[].apiFormat` and `path` control translation and routing.
+
+| Target | `provider` | `endpoint` | `apiFormat` | `path` | `auth.type` |
+|---|---|---|---|---|---|
+| **AWS Bedrock (Mantle)** | `aws-bedrock` | `bedrock-mantle.<region>.api.aws` | `openai-chat` | `/v1/chat/completions` | `apikey` (or `sigv4`) |
+| OpenAI | `openai` | `api.openai.com` | `openai-chat` | `/v1/chat/completions` | `apikey` |
+| Anthropic direct | `anthropic` | `api.anthropic.com` | `messages` | `/v1/messages` | `apikey` |
+| Azure OpenAI | `azure` | `<resource>.openai.azure.com` | `openai-chat` | `/openai/deployments/{deployment}/chat/completions` | `apikey` |
+| Google Vertex | `vertex` | `<region>-aiplatform.googleapis.com` | `openai-chat` | per Vertex OpenAI path | `oauth2` |
 
 Notes for a multi-provider design:
 
-- **Anthropic direct** — system messages get extracted to a top-level `system` field; `tools[]` converted to `input_schema` form; `frequency_penalty`, `presence_penalty`, `logprobs`, `n`, `response_format`, and `seed` are **silently dropped**. Worth knowing before an analyst files a bug.
-- **Vertex AI** — requires plugin-level IPP config (project, location, endpoint), and OAuth2 tokens **expire hourly**, so the Secret needs continuous refresh. Not a fit for a static-credential gateway without automation.
-- **Google Gemini via `openai`** — currently broken. The translator hardcodes `/v1/chat/completions` but Gemini needs `/v1beta/openai/chat/completions`. Registration succeeds, inference 404s. Tracked as RHOAIENG-68592.
-- **Bedrock is the least troublesome** of the set. If the customer wants Claude specifically, routing it through Bedrock Mantle rather than the Anthropic API avoids the parameter-dropping behaviour above and keeps the commercial relationship inside their existing AWS agreement.
+- **`path` is per-binding and supports `{key}` placeholders** resolved from the merged config map (model config overrides provider config). This is what fixes the 3.4 limitation where the translator hardcoded `/v1/chat/completions` — Google Gemini needs `/v1beta/openai/chat/completions` and simply 404'd. In 3.5 you set `path` and it works.
+- **`config`** carries provider-specific k/v — e.g. Vertex `{"project": "...", "location": "..."}` — and can be overridden per model binding.
+- **`weight`** across multiple `externalProviderRefs` gives one client-facing model name a traffic split: same model in two regions, or a canary between vendors, with no client change.
+- **`auth.type: sigv4`** is in the enum, suggesting native AWS SigV4 signing without a long-lived ABSK key. Not validated in this runbook — worth investigating for production, since removing the long-lived credential is a materially better posture.
+- **Anthropic via Bedrock beats Anthropic direct** for most customers: `openai-chat` format avoids the Messages-API parameter dropping, and it keeps the commercial relationship inside their existing AWS agreement.
+- **Vertex OAuth2 tokens expire hourly**, so the Secret needs continuous refresh — not a fit for a static-credential gateway without automation.
 
 # Appendix C — Notes for the customer conversation
 
@@ -2336,6 +2777,7 @@ oc get $CSV -n redhat-ods-operator -o jsonpath='{.metadata.annotations.alm-examp
 | Identity | `system:authenticated`, `oc whoami -t` | Keycloak / Entra / Okta | §2.5 `gatewayconfig.spec.oidc`; §4.5 real groups instead of `system:authenticated` |
 | Database | In-cluster PostgreSQL | RDS or managed Postgres | §2.6 — `sslmode=require`, real credentials, backup policy |
 | Network | Connected | Possibly air-gapped | Mirror all images; §5.5 detector images especially |
+| Egress to AWS | Direct | Proxy / firewall rules for `bedrock-mantle.<region>.api.aws` | Raise the firewall request early — it is usually a ticket with lead time |
 | AWS account | Throwaway, admin | Governed, SCPs likely | §3.3 IAM user creation may be blocked; §3.6 tighten permissions is mandatory |
 | Region | `us-east-1` | Compliance-driven | §3.1 — settle data residency BEFORE building |
 | RHOAI channel | `stable-3.5`, Manual approval | Same, but agree a patching policy | §2.2 |
@@ -2398,7 +2840,8 @@ Fill this in once per environment, as you work through Part 2. Parts 4–6 read 
 | Fact | How to get it | Reference cluster (sandbox) | Your site |
 |---|---|---|---|
 | Cluster domain | `oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}'` | `apps.rhoai.<sandbox-id>.opentlc.com` | |
-| **MAAS_GW** | `oc get gatewayconfig default-gateway -o jsonpath='{.status.domain}'` | `https://rh-ai.apps.rhoai.<sandbox-id>.opentlc.com` | |
+| **MAAS_GW** | LB: `https://maas.<cluster-domain>` · Route: `oc get route maas-gateway -n openshift-ingress -o jsonpath='{.spec.host}'` | `https://maas-gw.apps.rhoai.<sandbox-id>.opentlc.com` (ClusterIP + passthrough Route) | |
+| Dashboard URL (NOT MaaS) | `oc get gatewayconfig default-gateway -o jsonpath='{.status.domain}'` | `rh-ai.apps.rhoai.<sandbox-id>.opentlc.com` | |
 | OCP version | `oc get clusterversion version -o jsonpath='{.status.desired.version}'` | 4.22.10 | |
 | Platform | `oc get infrastructure cluster -o jsonpath='{.status.platform}'` | AWS | |
 | RHOAI CSV | `oc get csv -n redhat-ods-operator` | `rhods-operator.3.5.0` (GA, `stable-3.5`) | |
@@ -2408,6 +2851,10 @@ Fill this in once per environment, as you work through Part 2. Parts 4–6 read 
 | Ingress mode | `oc get gatewayconfig default-gateway -o jsonpath='{.spec.ingressMode}'` | `OcpRoute` | |
 | Ingress cert secret | `oc get ingresscontroller default -n openshift-ingress-operator -o jsonpath='{.spec.defaultCertificate.name}'` | (default) | |
 | Default StorageClass | `oc get storageclass \| grep default` | `gp3-csi` | |
+| MaaS Gateway exposure | `oc get svc -n openshift-ingress \| grep maas` | ClusterIP + passthrough Route (switched from ELB — §2.5f) | |
+| MaaS listener hostname | `oc get gateway maas-default-gateway -n openshift-ingress -o jsonpath='{.spec.listeners[0].hostname}'` | `maas-gw.apps.rhoai.<sandbox-id>.opentlc.com` | |
+| MaaS infra namespace | `oc get pods -n redhat-ai-gateway-infra` | `redhat-ai-gateway-infra` (maas-api lives here) | |
+| Tenant CRDs | `oc get aitenant,maastenantconfig -A` | `AITenant` (ai-tenants) + `MaasTenantConfig` (models-as-a-service) | |
 | **NS allowlist BEFORE §2.8** | `oc get gateway data-science-gateway -n openshift-ingress -o jsonpath='{.spec.listeners[0].allowedRoutes.namespaces.selector}'` | name-based: `openshift-ingress`, `redhat-ods-applications` | |
 | **NS allowlist AFTER §2.8** | same command | *(record during §2.8 discovery)* | |
 | **NS admission mechanism** | §2.8 discovery | *(operator-managed / GatewayConfig / label)* | |
@@ -2419,6 +2866,7 @@ Fill this in once per environment, as you work through Part 2. Parts 4–6 read 
 | Model namespace | §4.1 | `external-models` | |
 | Models registered | §4.3–4.4 | `bedrock-gpt-oss-20b`, `bedrock-claude-sonnet` | |
 | Guardrails namespace | §5.2 | `guardrails` | |
+| Dashboard flags set | `oc get odhdashboardconfig odh-dashboard-config -n redhat-ods-applications -o jsonpath='{.spec.dashboardConfig}'` | modelAsService, externalModels, guardrails, observabilityDashboard | |
 
 **Environment-specific decisions** (see Appendix E for the reasoning):
 
