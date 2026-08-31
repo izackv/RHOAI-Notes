@@ -685,6 +685,7 @@ Three governance condition keys exist if the customer wants to constrain this ce
 5. Optionally expand **Advanced permissions** to attach additional policies
 6. **Generate**
 7. **Copy the key immediately** — it starts with `ABSK` and is shown once
+8. **Validate it** using the length/prefix check in §3.5 before doing anything else
 
 ## 3.5 Generate the key — CLI
 
@@ -708,68 +709,169 @@ aws iam create-service-specific-credential \
   --credential-age-days 90
 ```
 
-The `ServiceSpecificCredential.ServicePassword` field in the output is your ABSK key. **It is shown once.**
+### Which field is the key
+
+The ABSK key is in **`ServiceSpecificCredential.ServiceCredentialSecret`**. **It is shown once.**
+
+> **Field name warning.** AWS has renamed this field across API versions and the docs lag behind the API. Depending on your CLI version you may see `ServiceCredentialSecret`, `ServiceApiKeyValue` (what the current AWS docs and Python examples show), or a legacy `ServicePassword` inherited from the CodeCommit-era version of this API. **Do not go by field name — go by content.** The key is the one value in the response that begins with `ABSK`. Some responses contain more than one secret-looking field, and picking the wrong one produces a valid-looking string that Bedrock rejects with `invalid_api_key` / *"Invalid bearer token"*.
+
+Other fields in the response are metadata, not the key: `ServiceCredentialAlias` (e.g. `rhoai-maas-bedrock-at-<account-id>`), `ServiceSpecificCredentialId` (starts with `ACCA`, used for reset/delete), `Status`, `CreateDate`, `ExpirationDate`.
+
+### Capture and validate the key
+
+Copy the `ABSK...` value from the output, then:
 
 ```bash
-export BEDROCK_API_KEY="ABSK..."
+read -rs BEDROCK_API_KEY && export BEDROCK_API_KEY   # paste, press Enter; nothing echoes
+echo "len=${#BEDROCK_API_KEY} prefix=${BEDROCK_API_KEY:0:4} tail=${BEDROCK_API_KEY: -6}"
 ```
+
+**Validate all three before going any further:**
+
+| Check | Expected | If wrong |
+|---|---|---|
+| `prefix` | `ABSK` | You copied the wrong field. Find the `ABSK` value. |
+| `len` | **132** | **131 or fewer = truncated copy.** Re-copy. This is the single most common failure in this whole procedure. |
+| `tail` | matches the last 6 chars of the source | Mid-string mangle — re-copy. |
+
+> **A 131-character key looks completely legitimate.** Right prefix, plausible length, and AWS rejects it with a `permission_denied_error`, which sends you off investigating IAM policies and SCPs. Check the length first; it costs one second and it is the answer more often than anything else.
+>
+> Prefix and length together still pass on a key that had a character *substituted* rather than dropped, which is why the `tail` comparison is worth the extra look.
+
+Confirm the credential registered:
+
+```bash
+aws iam list-service-specific-credentials \
+  --user-name rhoai-maas-bedrock \
+  --service-name bedrock.amazonaws.com
+```
+
+Expect `Status: Active`. Note the `ServiceSpecificCredentialId` — you need it to reset or delete the key later. Newly created credentials are not instantly consistent; if a call fails within the first minute of creation, wait and retry before assuming anything is broken.
+
+### If you lost the key or it was truncated
+
+The value cannot be retrieved after creation. Reset it in place:
+
+```bash
+aws iam reset-service-specific-credential \
+  --user-name rhoai-maas-bedrock \
+  --service-specific-credential-id <ServiceSpecificCredentialId>
+```
+
+This returns a fresh secret. Re-run the validation above.
 
 > An IAM user can hold **up to two** long-term Bedrock keys. That is deliberate — it lets you rotate without downtime: create the second, roll the cluster Secret, then delete the first.
 
 ## 3.6 Tighten permissions
 
-`AmazonBedrockLimitedAccess` is broader than a gateway needs. For Mantle inference the action is `bedrock-mantle:CreateInference`.
+**Skip this for a throwaway PoC account.** `AmazonBedrockLimitedAccess` already grants everything Mantle needs (see §3.3), so a working key keeps working and you avoid re-breaking the one thing that functions. Come back here before anything touches a real account.
 
-**Console:** **Bedrock → API keys → Long-term API keys →** select your key **→ Manage in IAM Console → Permissions →** remove `AmazonBedrockLimitedAccess` **→ Add permissions → Create inline policy → JSON**.
+### Why it matters on a real account
 
-**CLI:**
+`AmazonBedrockLimitedAccess` is far broader than "call a model." Read the current policy document and the gateway user also gets:
+
+| Granted action | Risk |
+|---|---|
+| `bedrock:CreateProvisionedModelThroughput` | Commits real hourly spend |
+| `bedrock:CreateModelCustomizationJob`, `CreateModelImportJob`, `CreateEvaluationJob` | Training / evaluation spend |
+| `bedrock:DeleteGuardrail`, `UpdateGuardrail` | Can dismantle safety controls the customer built |
+| `aws-marketplace:Subscribe` | Can subscribe the account to paid third-party models |
+| `ec2:DescribeVpcs`, `DescribeSubnets`, `DescribeSecurityGroups`, `iam:ListRoles` | Network and identity reconnaissance |
+
+Now recall where this credential lives: a long-lived key in a Kubernetes Secret, readable by anyone with RBAC on that namespace, valid for up to 90 days. That is exactly the credential you want minimally scoped, and it is the first thing a security review will raise.
+
+### Use the AWS-managed Mantle policy
+
+`AmazonBedrockMantleInferenceAccess` was created specifically for this and is the narrowest managed policy sufficient for Mantle inference. It covers both SigV4 and API-key auth:
+
+```json
+{
+  "Sid": "BedrockMantleInference",
+  "Effect": "Allow",
+  "Action": ["bedrock-mantle:Get*", "bedrock-mantle:List*", "bedrock-mantle:CreateInference"],
+  "Resource": "arn:aws:bedrock-mantle:*:*:project/*"
+},
+{
+  "Sid": "BedrockMantleCallWithBearerToken",
+  "Effect": "Allow",
+  "Action": ["bedrock-mantle:CallWithBearerToken"],
+  "Resource": "*"
+}
+```
+
+**Attach first, detach second.** Reversing the order leaves the key with zero permissions in between.
 
 ```bash
+aws iam attach-user-policy \
+  --user-name rhoai-maas-bedrock \
+  --policy-arn arn:aws:iam::aws:policy/AmazonBedrockMantleInferenceAccess
+
 aws iam detach-user-policy \
   --user-name rhoai-maas-bedrock \
   --policy-arn arn:aws:iam::aws:policy/AmazonBedrockLimitedAccess
 
-cat > bedrock-inline.json <<EOF
+# Confirm the key still works BEFORE walking away
+curl -s "https://bedrock-mantle.${AWS_REGION}.api.aws/v1/models" \
+  -H "Authorization: Bearer ${BEDROCK_API_KEY}" | jq -r '.data[0].id'
+```
+
+**Console:** **Bedrock → API keys → Long-term API keys →** select the key **→ Manage in IAM Console → Permissions →** add `AmazonBedrockMantleInferenceAccess`, then remove `AmazonBedrockLimitedAccess`.
+
+### Hand-rolled policy
+
+If the customer wants the account and region pinned:
+
+```json
 {
   "Version": "2012-10-17",
   "Statement": [
-    {
-      "Sid": "MantleInference",
+    { "Sid": "MantleInference",
       "Effect": "Allow",
-      "Action": ["bedrock-mantle:CreateInference"],
-      "Resource": "*"
-    },
-    {
-      "Sid": "ListModels",
+      "Action": ["bedrock-mantle:CreateInference", "bedrock-mantle:Get*", "bedrock-mantle:List*"],
+      "Resource": "arn:aws:bedrock-mantle:us-east-1:<ACCOUNT-ID>:project/*" },
+    { "Sid": "BearerTokenAuth",
       "Effect": "Allow",
-      "Action": ["bedrock:ListFoundationModels", "bedrock:GetFoundationModel"],
-      "Resource": "*"
-    }
+      "Action": ["bedrock-mantle:CallWithBearerToken"],
+      "Resource": "*" }
   ]
 }
-EOF
+```
 
+```bash
 aws iam put-user-policy \
   --user-name rhoai-maas-bedrock \
   --policy-name RhoaiMaasBedrockInference \
   --policy-document file://bedrock-inline.json
 ```
 
-Scope `Resource` down to specific model ARNs once you know which models the customer will actually expose.
+> **`bedrock-mantle:CallWithBearerToken` is mandatory and easy to miss.** It authorizes using an API key as a bearer token at all. Omit it and every call fails with `invalid_api_key` / *"Invalid bearer token"* — indistinguishable from a truncated key, and you will waste an afternoon on it. It is also not resource-scopable; it must stay on `Resource: "*"`.
+>
+> `bedrock-mantle:Get*` and `List*` are needed for `/v1/models`. Drop them and model discovery breaks while inference still works.
 
-> Between detaching the managed policy and adding the inline one, the key has **zero** permissions. Do both in the same maintenance window.
+### Two related decisions
+
+**Marketplace-gated models.** The managed policy contains no `aws-marketplace:Subscribe`, so a third-party model may 403 on first call. Do **not** add that action to the gateway user — subscribe once, out of band, with an admin identity. A credential living in a cluster Secret should never be able to commit the account to paid services.
+
+**Never leave `iam:CreateServiceSpecificCredential` on this user.** A principal holding that permission plus `bedrock-mantle:CreateInference` can mint itself a service-specific credential and reach models that SCP-based restrictions were meant to block — a documented SCP-bypass path. The gateway user does not need it; you created its key from your admin identity.
+
 
 ## 3.7 Test the key from your laptop
 
 **Do this before touching OpenShift.** If this fails, nothing downstream will work and you will waste an hour debugging the wrong layer.
 
+**Re-validate the key before you test.** If this check does not pass, fix it here — everything below will fail in ways that look like other problems.
+
 ```bash
-export BEDROCK_API_KEY="ABSK..."
-export AWS_REGION="eu-central-1"
+echo "len=${#BEDROCK_API_KEY} prefix=${BEDROCK_API_KEY:0:4}"
+# len=132 prefix=ABSK
+```
+
+```bash
+export AWS_REGION="us-east-1"
 
 # List available models in this region
 curl -s "https://bedrock-mantle.${AWS_REGION}.api.aws/v1/models" \
-  -H "Authorization: Bearer ${BEDROCK_API_KEY}" | jq -r '.data[].id'
+  -H "Authorization: Bearer ${BEDROCK_API_KEY}" | jq -r '.data[] | "\(.id)  [\(.status)]"'
 
 # Pick one from the list above
 export TARGET_MODEL="openai.gpt-oss-20b"
@@ -777,17 +879,46 @@ export TARGET_MODEL="openai.gpt-oss-20b"
 curl -s "https://bedrock-mantle.${AWS_REGION}.api.aws/v1/chat/completions" \
   -H "Authorization: Bearer ${BEDROCK_API_KEY}" \
   -H "Content-Type: application/json" \
-  -d "{\"model\":\"${TARGET_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in 3 words.\"}],\"max_tokens\":20}" | jq .
+  -d "{\"model\":\"${TARGET_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in 3 words.\"}],\"max_tokens\":300}" | jq .
 ```
 
-A successful response has a `choices` array.
+A successful response has a `choices` array with non-null `message.content`.
+
+> **`max_tokens` must be generous — 300, not 20.** Reasoning models such as `gpt-oss-20b` emit a `reasoning` field before `content`, and those tokens count against `max_tokens`. With a small budget you get `finish_reason: "length"` and `content: null`, which looks like a broken integration but is only a truncated answer. Check `usage.completion_tokens` — if it exactly equals your `max_tokens`, that is what happened.
+
+### Reading the model list
+
+Each entry carries a `status` (`available` / `unavailable`) and a `data_retention` block with `allowed_modes` of `none`, `default`, and `provider_data_share`. Some models are `unavailable` specifically because they are not offered under the account's current retention mode.
+
+That field is the concrete answer to *"where do our prompts go?"* — which means **model availability is partly a governance decision, not just a technical one**. Surface this with the customer early, especially anywhere data residency is in play. Confirm whether retention mode can be pinned per model via the `ExternalModel` CR or the payload processor, or whether it always inherits the account default.
 
 | Failure | Meaning |
 |---|---|
-| `401` | Key wrong, expired, or truncated on copy |
+| `invalid_api_key` / *"Invalid bearer token"* | **Check key length first (§3.5).** A truncated 131-char key gives exactly this. Then: wrong field copied, key expired, credential not yet propagated, or an SCP denying `bedrock-mantle:CallWithBearerToken`. |
 | `403` | IAM policy too narrow, or an SCP is blocking Bedrock |
 | `404` | Wrong endpoint (`bedrock-runtime` instead of `bedrock-mantle`), or the model is not on Mantle in this region |
 | `400` | Model ID not available in this region — re-check the `/v1/models` output |
+| `<UnknownOperationException/>` | That operation does not exist at that path. Not an auth failure — the request never reached authentication. |
+| `choices[0].message.content` is `null` | Not a failure. Reasoning model ran out of `max_tokens` — raise it. |
+
+### Isolating a stubborn auth failure
+
+If the key validates but calls still fail, work down this ladder. Each step rules out a layer:
+
+1. **Confirm the credential is `Active`** and note its age — `aws iam list-service-specific-credentials`. Under a minute old? Wait and retry.
+2. **Re-extract the key** via `reset-service-specific-credential` and re-validate length. Do this *before* investigating anything more exotic.
+3. **Try another region** (`us-east-1` is the safest) to rule out regional enablement.
+4. **Check who you are** — `aws sts get-caller-identity`. Note that `AWS_BEARER_TOKEN_BEDROCK` with the AWS CLI may be ignored in favour of ambient SigV4 credentials, so a *successful* CLI call does not prove your bearer token works. Test bearer tokens with `curl`, not the CLI.
+5. **Suspect an SCP only after the above.** In an AWS Organization, this published guardrail denies exactly this and produces identical symptoms to a bad key:
+   ```json
+   { "Effect": "Deny",
+     "Action": ["bedrock:CallWithBearerToken", "bedrock-mantle:CallWithBearerToken"],
+     "Resource": "*",
+     "Condition": { "StringEquals": { "bedrock:bearerTokenType": "LONG_TERM" } } }
+   ```
+   Confirm by generating a **short-term** key (Bedrock console → API keys → Short-term, or the `aws-bedrock-token-generator` package) and repeating the call. Short-term works while long-term fails ⇒ SCP. `organizations:DescribeOrganization` returning AccessDenied proves nothing — sandbox users rarely hold that permission either way.
+
+   If an SCP is confirmed, no console workaround exists — SCPs are evaluated above IAM and apply to console sessions too. You need a different AWS account. Raise it with the customer: if their org runs the same guardrail, this integration pattern is blocked for them and that shapes the design.
 
 ---
 
@@ -835,7 +966,14 @@ oc get secret bedrock-api-key -n ${MODEL_NS} -o jsonpath='{.data}' | jq 'keys'
 
 > Never commit this to Git. If you are doing GitOps, use External Secrets Operator or Sealed Secrets and reference the ABSK from a vault. The `ExternalModel` CR itself is safe to commit — it holds only a `credentialRef`.
 
-Avoid shell history leakage:
+**Validate the key one final time before it goes into the cluster.** A truncated key stored in a Secret fails later as an opaque `401` from AWS buried in payload-processor logs, which is far more expensive to diagnose than here:
+
+```bash
+echo "len=${#BEDROCK_API_KEY} prefix=${BEDROCK_API_KEY:0:4}"
+# len=132 prefix=ABSK  — anything else, go back to §3.5
+```
+
+Use `read -rs` to paste the key without it landing in shell history:
 
 ```bash
 read -rs BEDROCK_API_KEY && export BEDROCK_API_KEY
@@ -992,7 +1130,7 @@ echo "${API_KEY:0:12}..."
 curl -sk "${MAAS_GW}/${MODEL_NS}/bedrock-gpt-oss-20b/v1/chat/completions" \
   -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
-  -d "{\"model\":\"${TARGET_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in 3 words.\"}],\"max_tokens\":20}" | jq .
+  -d "{\"model\":\"${TARGET_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in 3 words.\"}],\"max_tokens\":300}" | jq .
 ```
 
 Path structure: `https://maas.<domain>/<model-namespace>/<model-name>/v1/chat/completions`
@@ -1018,7 +1156,7 @@ curl -sk -o /dev/null -w "no auth:    %{http_code}\n" \
 curl -sk -D - -o /dev/null \
   "${MAAS_GW}/${MODEL_NS}/bedrock-gpt-oss-20b/v1/chat/completions" \
   -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" \
-  -d '{"model":"'"${TARGET_MODEL}"'","messages":[{"role":"user","content":"hi"}],"max_tokens":10}' \
+  -d '{"model":"'"${TARGET_MODEL}"'","messages":[{"role":"user","content":"hi"}],"max_tokens":300}' \
   | grep -i ratelimit
 ```
 
@@ -1057,6 +1195,11 @@ In the RHOAI dashboard, the **Observability** tab shows per-team token consumpti
 | `404` from the gateway | Using `bedrock-runtime` instead of `bedrock-mantle` | Fix `spec.endpoint` |
 | `404`, endpoint correct | Model not available on Mantle in that region | Re-check `/v1/models` for the region |
 | `401` from AWS (visible in IPP logs) | Secret missing `bbr-managed` label, or wrong data key | Label must be `inference.networking.k8s.io/bbr-managed=true`; key must be `api-key` |
+| `invalid_api_key` / "Invalid bearer token" from AWS | **Truncated ABSK key (131 chars instead of 132)** — by far the most common cause | `oc get secret bedrock-api-key -n ${MODEL_NS} -o jsonpath='{.data.api-key}' \| base64 -d \| wc -c` → must be 132. Re-create the Secret. |
+| Copied a valid-looking key that AWS rejects | Wrong field taken from `create-service-specific-credential` | The key is whichever field starts with `ABSK` — not the alias, not the credential ID. See §3.5 |
+| Key worked, then broke right after tightening IAM | Custom policy missing `bedrock-mantle:CallWithBearerToken` | Add it on `Resource: "*"`, or re-attach `AmazonBedrockMantleInferenceAccess` (§3.6) |
+| `/v1/models` 403s but inference works | Policy missing `bedrock-mantle:Get*` / `List*` | Add both (§3.6) |
+| `content: null`, `finish_reason: "length"` | Reasoning model exhausted `max_tokens` — **not** a failure | Raise `max_tokens` to 300+ |
 | `403` from the gateway | No matching `MaaSAuthPolicy` for the caller's groups | Check `modelRefs` and `subjects.groups` |
 | `429` unexpectedly | Subscription limit too low, or Limitador counters shared | Raise `tokenRateLimits.limit` or split subscriptions |
 | Gateway never `Programmed` | Non-cloud platform without MetalLB; or cert secret name wrong | §2.6 |
@@ -1131,10 +1274,13 @@ aws iam delete-service-specific-credential \
 [ ] Model access confirmed (Marketplace subscription if required)
 [ ] IAM user created (deliberately named) or SCP workaround identified
 [ ] ABSK long-term key generated with expiry
-[ ] IAM policy tightened to bedrock-mantle:CreateInference
+[ ] Key VALIDATED: len=132, prefix=ABSK, tail matches source (§3.5)
+[ ] IAM tightened (SKIP for throwaway PoC) — AmazonBedrockMantleInferenceAccess,
+    attach-before-detach, MUST include bedrock-mantle:CallWithBearerToken (§3.6)
 [ ] Key tested directly against bedrock-mantle — /v1/models and /v1/chat/completions
 --- Integration ---
 [ ] external-models namespace created and labelled gateway-access=true
+[ ] Key re-validated (len=132) immediately before creating the Secret
 [ ] Secret bedrock-api-key: key=api-key, label bbr-managed=true
 [ ] ExternalModel applied (provider bedrock-openai, mantle endpoint)
 [ ] MaaSModelRef applied; PHASE = Ready
