@@ -17,6 +17,7 @@
 > | 7 — Troubleshooting | ✅ Verified | Every entry hit during the build |
 > | 8 — Cleanup | 📝 Untested | Not exercised |
 > | A–F — Appendices | ✅ Verified | Reflect the working cluster |
+| H — Day 2: what breaks later | ✅ Verified | Credential lifecycle and the two failures observed overnight |
 > | G — Undocumented findings | ✅ Verified | **May become stale — see below** |
 >
 > **Status meanings:** ✅ *Verified* — executed on the cluster below, worked. 📝 *Untested plan* — written from schema and docs, never run; treat as a starting point. ⚠️ *Partly verified* — mixed, marked inline.
@@ -53,37 +54,67 @@ Three demonstrable capabilities, built in order:
 | 2 | **Governed model access** — same Bedrock models, now with metering, quota, revocation, and model swap | The organisation gets control without costing the analyst anything |
 | 3 | **Guardrailed lane** — PII and toxicity filtered before anything leaves the cluster | Content control on top of access control. The data-residency answer. |
 
-### Target architecture
+### Target architecture — as built and verified
 
 ```
-Analyst / notebook
-      │
-      │  Lane A (direct)           Lane B (guardrailed)
-      │  Bearer <MaaS key>         Bearer <MaaS key>
-      ▼                            ▼
-      │                     Guardrails Orchestrator ── regex detectors (PII)
-      │                            │                └─ HAP detector (CPU model)
-      │                            │
-      └──────────┬─────────────────┘
-                 ▼
-      maas.<cluster-domain>              ← MaaS Gateway (Envoy / Gateway API)
-                 │
-                 ├─ Authorino   → validates MaaS key, STRIPS Authorization header
-                 ├─ Limitador   → enforces token quota from MaaSSubscription
-                 └─ BBR / IPP   → injects the Bedrock ABSK key from a K8s Secret
-                 ▼
-      bedrock-mantle.us-east-1.api.aws   ← AWS Bedrock, OpenAI-compatible
+                       Analyst / notebook
+                                |
+            +-------------------+-------------------+
+            |                                       |
+      LANE A: direct                        LANE B: guardrailed
+   Bearer <MaaS API key>                   Bearer <OpenShift token>
+   POST /v1/chat/completions               POST /v1/chat/completions
+   {"model":"mistral-large"}               {"model":"mistral-large"}
+            |                                       |
+            |                                       v
+            |                          NeMo Guardrails service
+            |                          1. self check input
+            |                          2. main completion
+            |                          3. self check output
+            |                          all three calls go via MaaS
+            |                          blocked -> never reaches AWS
+            |                                       |
+            +-------------------+-------------------+
+                                |
+                                v
+                  OpenShift Route (passthrough)
+                                |
+                                v
+                      maas.<cluster-domain>
+    +--------------------------------------------------------------+
+    |  maas-default-gateway  (Envoy, Gateway API, 2 replicas)      |
+    |                                                              |
+    |  Authorino   validate key, STRIP Authorization header,       |
+    |              inject x-maas-username / group / subscription   |
+    |  Limitador   token quota from MaaSSubscription               |
+    |  ext_proc ipp-pre   body "model" -> X-Gateway-Model-Name     |
+    |  ext_proc ipp       maas-headers-guard                       |
+    |                     -> stream-usage-enforcer                 |
+    |                     -> model-provider-resolver               |
+    |                     -> api-translation                       |
+    |                     -> apikey-injection (ABSK from Secret)   |
+    +--------------------------------------------------------------+
+                                |
+                                v
+                bedrock-mantle.us-east-1.api.aws
+                 AWS Bedrock, OpenAI-compatible
 ```
 
-The analyst never sees the AWS credential. That is the entire point.
+**Two properties worth stating out loud:**
+
+The analyst's credential is validated and **stripped** by Authorino; the AWS key is injected separately by the payload processor from a Kubernetes Secret. Neither credential ever meets the other side.
+
+NeMo's own self-check LLM calls go **through MaaS**, so the guardrail's LLM usage is authenticated, metered and attributable like any other traffic. The guardrail is not a blind spot in the governance model — but it does mean **NeMo holds its own MaaS API key, and when that key expires every guardrailed request returns `Internal server error`** with the real cause (`HTTP 401`) visible only in the NeMo pod log. See Appendix H for the full credential inventory and rotation procedure.
+
+**Verified numbers:** ~1s per call through Lane A. Lane B costs up to three LLM calls per request. A blocked prompt produces **zero** calls to AWS.
 
 ### Where the guardrails sit, and why
 
-The orchestrator goes **in front of** the MaaS gateway: `client → orchestrator → MaaS gateway → Bedrock`.
+The guardrails service sits **in front of** the MaaS gateway: `client → NeMo → MaaS gateway → Bedrock`.
 
-The alternative — pointing `ExternalModel.spec.endpoint` at an in-cluster orchestrator so guardrails sit *behind* MaaS — is fragile. The provider builds a ServiceEntry and DestinationRule with TLS origination aimed at an external FQDN; aiming that at a cluster-local service is not what it is designed for. Do not build a customer demo on it.
+The alternative — running guardrails **inside** the gateway as IPP plugins (`nemo-request-guard` / `nemo-response-guard`, which exist in the payload-processing binary) — is architecturally better because no bypass is possible. It is undocumented; see §5.7.
 
-The usual objection to orchestrator-in-front is that an analyst could bypass guardrails by calling the MaaS URL directly. That is solved at the authorization layer rather than with topology: scope the direct lane's `MaaSAuthPolicy` to the orchestrator's ServiceAccount only, and give the analyst group access to the guardrailed lane. It also demos well — the bypass attempt returns 403 on camera.
+With guardrails in front, an analyst can skip them by calling the MaaS URL directly. That is closed at the authorization layer rather than with topology: scope the direct lane's `MaaSAuthPolicy` to the orchestrator's ServiceAccount. **Do this after the governance demo, not before** — §6.3's checks depend on the direct lane working. Full reasoning and the three-state model in §5.6.
 
 ### Facts worth knowing before you start
 
@@ -2634,7 +2665,46 @@ Allow ~3–10s per request: each one is up to three LLM calls (self-check input,
 
 With `security.opendatahub.io/enable-auth: "true"` the Route requires an OpenShift token. For analyst-facing use, front it with the MaaS gateway instead — which is what topology B solves properly.
 
-## 5.6 Close the bypass (topology A only)
+## 5.6 Closing the bypasses — and when to do it
+
+**There are two different bypasses. They are closed in different places, and the order matters for the demo.**
+
+| Bypass | What the analyst does | Closed by | When |
+|---|---|---|---|
+| **A — direct to AWS** | Uses their own ABSK/IAM credential against Bedrock, ignoring the cluster entirely | **AWS-side revocation** of the analyst's IAM credential. Nothing in RHOAI can prevent it | At migration, once the gateway is trusted |
+| **B — skip the guardrails** | Uses their MaaS key against the MaaS URL instead of the guardrails route | `MaaSAuthPolicy` scoped to the orchestrator's identity | After the governance demo |
+
+Neither is a defect. They are the two doors you close, in sequence, as the customer moves from today's state to the target state.
+
+### The three states — and why the demo needs all of them
+
+| State | Analyst holds | Reach Bedrock directly? | Skip guardrails? |
+|---|---|---|---|
+| **1. Today** | A long-lived AWS key on their desktop | **Yes** | n/a — there are none |
+| **2. Governed** | A MaaS API key only | **No** — AWS key revoked | Yes |
+| **3. Guarded** | A MaaS API key only | No | **No** |
+
+**Do not close bypass B before the governance demo.** State 2 is where metering, quota, revocation and model-swap are shown (§6.3). If the direct MaaS lane is already locked down, those checks fail and the story collapses into "everything is blocked", which proves nothing about governance.
+
+**Demo order:**
+
+1. **State 1** — show the analyst's current workflow: a Bedrock URL and an AWS key. Optionally run it live from a notebook. This is the "before".
+2. **State 2** — §6.2 and §6.3. Same models, same SDK, now with attribution, quota, revocation and model swap. The AWS key would be revoked at this point in a real migration; you do not need to actually revoke it for a demo.
+3. **State 3** — §6.4. Guardrails, then the bypass attempt returning 403.
+
+Closing B is what turns "we added a filter" into "the filter cannot be avoided", so it is worth doing — but only after state 2 has been demonstrated.
+
+### Closing bypass A (customer migration, not a demo step)
+
+```bash
+aws iam list-service-specific-credentials --user-name <analyst-iam-user>
+aws iam delete-service-specific-credential \
+  --user-name <analyst-iam-user> --service-specific-credential-id <id>
+```
+
+The point to make: **this is the only credential that ever needs rotating**, and revoking it does not disturb anyone else — unlike today, where a shared key means rotation affects every analyst.
+
+### Closing bypass B (§5.6 proper)
 
 ```bash
 NEMO_SA=$(oc get pods -n ${GR_NS} -o jsonpath='{.items[0].spec.serviceAccountName}')
@@ -2643,7 +2713,23 @@ echo "NeMo SA: $NEMO_SA"
 oc explain maasauthpolicy.spec.subjects --recursive
 ```
 
-If `subjects` supports service accounts, scope the direct lane to NeMo's SA. If it only supports `groups` and `users`, bind the SA to a dedicated group and use that. Then the analyst's key against the raw MaaS URL returns **403**, and only the guardrailed route works — a good demo beat.
+If `subjects` supports service accounts, scope the direct lane to NeMo's SA. If it only supports `groups` and `users` — which was the case on the reference cluster — bind the SA to a dedicated group and reference that instead.
+
+Then the analyst's key against the raw MaaS URL returns **403**, while the guardrails route returns a completion:
+
+```bash
+curl -sk -o /dev/null -w "direct MaaS:  %{http_code}\n" "${MAAS_GW}/v1/chat/completions" \
+  -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" \
+  -d '{"model":"mistral-large","messages":[{"role":"user","content":"hi"}],"max_tokens":100}'
+# expect 403
+
+curl -sk -o /dev/null -w "guardrailed:  %{http_code}\n" "${GR_ROUTE}/v1/chat/completions" \
+  -H "Authorization: Bearer $(oc whoami -t)" -H "Content-Type: application/json" \
+  -d '{"model":"mistral-large","messages":[{"role":"user","content":"hi"}],"max_tokens":300}'
+# expect 200
+```
+
+> **📝 Not executed on the reference cluster.** The rest of Part 5 is verified; this section is not. It will break §6.3's direct-lane checks once applied, so apply it **after** rehearsing state 2, or keep a second unrestricted subscription for those checks.
 
 ## 5.7 Topology B — IPP plugins (investigation, not a procedure)
 
@@ -2736,6 +2822,15 @@ for i in $(seq 1 6); do
     -d "{\"model\":\"${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":300}"
 done
 ```
+
+> ## ⚠ Two things break this system silently, with no operator action
+>
+> | What | How it shows | Fix |
+> |---|---|---|
+> | **HTTPRoute patch reverts** (Appendix G §2, §10) | Every call `404` | Re-apply the §4.5b patch |
+> | **A gateway replica goes stale** (Appendix G §6) | ~10–50% of calls `503` | Restart the gateway deployment |
+>
+> Both were observed **overnight, with nobody touching the cluster.** Steps 3 and 6 above are therefore not optional, and "it worked at rehearsal" is not evidence it works now. **Run this pre-flight immediately before presenting, not an hour before.**
 
 Any 503 → restart the gateway and repeat step 6:
 
@@ -2884,6 +2979,8 @@ Mint a new one and carry on.
 ---
 
 ## 6.4 Demo 3 — Guardrails
+
+> **Sequencing:** §6.2–6.3 demonstrate *state 2* (governed access, direct MaaS lane open). This section moves to *state 3* (guardrails mandatory). Do not close bypass B (§5.6) before rehearsing §6.3 — the direct-lane checks there depend on that lane still working. See §5.6 for the three-state model.
 
 **Not yet built.** Part 5 covers the design; it was not implemented on the reference cluster. Describe it, don't demo it:
 
@@ -3580,9 +3677,39 @@ Option 2 is the quicker route to a working Claude model, at the cost of a separa
 
 HTTPRoute status shows `kuadrant.io/TokenRateLimitPolicyAffected: True` and `MaaSSubscription` is Active, but responses carry no `X-RateLimit-*` headers. Quota demos need the observability dashboard instead of response headers. Enforcement itself is untested at the limit.
 
-## 6. Two gateway replicas, one can hold stale config
+## 6. Gateway replicas go stale — two symptoms, and it recurs over time
 
-After changing the gateway Service type or listener hostname, one replica may serve stale upstream config: ~50% of calls return `503 UC,DC` after ~60s while the rest succeed in <1s. Distinguishable by pod IP in the Envoy access log. `oc rollout restart` fixes it. Worth an automatic reconcile.
+One of the two gateway replicas can end up serving stale configuration. **The symptom depends on how the gateway is exposed**, and the second form is easy to misdiagnose as a client problem:
+
+| Exposure | Symptom | Where it appears |
+|---|---|---|
+| LoadBalancer (ELB) | `503` after a full ~60s hang, ~50% of calls | Envoy access log, flags `UC,DC downstream_remote_disconnect` |
+| **ClusterIP + Route** | **`503` in <1s, ~10% of calls** | **Nowhere in the Envoy log** — the OpenShift router fails fast against a pod not accepting connections, so the request never reaches the gateway |
+
+**It is not only triggered by a config change.** On the reference cluster both pods ran healthy for an evening, then degraded overnight with no operator action — 25h uptime, having earlier been through a listener hostname change and the ClusterIP switch.
+
+Diagnosis:
+
+```bash
+# LoadBalancer form — compare the pod IP column across 200s and 503s
+oc logs -n openshift-ingress -l gateway.networking.k8s.io/gateway-name=maas-default-gateway \
+  --tail=20 | grep 'chat/completions'
+
+# ClusterIP form — nothing in the Envoy log means it never got there
+oc logs -n openshift-ingress -l gateway.networking.k8s.io/gateway-name=maas-default-gateway \
+  --since=10m | grep 'chat/completions' | grep -v ' 200 '
+oc get endpoints maas-default-gateway-data-science-gateway-class -n openshift-ingress \
+  -o jsonpath='{.subsets[*].addresses[*].ip}'
+```
+
+Fix, verified twice:
+
+```bash
+oc rollout restart deployment/maas-default-gateway-data-science-gateway-class -n openshift-ingress
+oc rollout status deployment/maas-default-gateway-data-science-gateway-class -n openshift-ingress --timeout=300s
+```
+
+Reference: 1-in-10 failures before restart, 12/12 clean after. For a demo where reliability beats HA, `--replicas=1` removes the variable entirely.
 
 ## 7. The MaaS hostname is NOT configurable in practice — ✅ consistent with docs
 
@@ -3715,3 +3842,110 @@ Ordered by what would most improve the product:
 | 3 | `ExternalProvider` reports Ready without validating the credential | Low — a status condition would have saved hours | ✅ Verified |
 | 5 | No `X-RateLimit-*` headers on responses despite the policy attaching | Low | ✅ Verified |
 | 4 | Anthropic on Bedrock Mantle unresolved; likely needs `sigv4` | Low — OpenAI-family models work | ⚠️ Untested hypothesis |
+
+---
+
+# Appendix H — Day 2: what breaks later
+
+Everything in this appendix was observed on the reference cluster. **Two of these failures happened overnight with no operator action**, so this is not theoretical.
+
+The build guide gets you working. This tells you what stops working, when, and how it looks when it does.
+
+## H.1 Credential inventory
+
+Four credentials, four lifetimes, four different failure modes. **None of them announces its own expiry.**
+
+| Credential | Where | Lifetime | Failure mode when it lapses | Owner |
+|---|---|---|---|---|
+| **AWS ABSK key** | Secret `bedrock-api-key` in the model namespace | Set at creation, max 90 days typical | `500 inference error: authType 'apikey' credentials not found`, or a 401 from AWS in the IPP log | Platform / cloud team |
+| **NeMo's MaaS API key** | Secret `nemo-upstream-key` **and** plaintext in ConfigMap `nemo-config` | Whatever `expiresIn` was requested; capped by `MaasTenantConfig.spec.apiKeys.maxExpirationDays` | **`Internal server error` on every guardrailed request.** The real cause (`HTTP 401`) appears only in the NeMo pod log | Platform team |
+| **Analyst MaaS API keys** | Held by users; state in PostgreSQL | Per key, chosen at creation | `401` on inference | Self-service |
+| **PostgreSQL credential** | Secret `maas-db-config` in the infra namespace | Long-lived | `maas-api` CrashLoopBackOff — no key minting, no revocation | Platform team |
+
+> **The NeMo key is the nastiest of the four.** It is stored in **two** places (the Secret, and in plaintext inside `config.yaml` because `spec.env` is ignored — Appendix G §9.3), and its failure surfaces to the caller as a generic `Internal server error` with no hint of a credential problem. Rotating it means updating both, then restarting the pod.
+
+Rotate the NeMo key:
+
+```bash
+NEMO_KEY=$(curl -sk -X POST "${MAAS_GW}/maas-api/v1/api-keys" \
+  -H "Authorization: Bearer $(oc whoami -t)" -H "Content-Type: application/json" \
+  -d '{"name":"nemo-guardrails","subscription":"analysts-standard","expiresIn":"24h"}' | jq -r '.key')
+
+# Verify BEFORE installing it
+curl -sk -o /dev/null -w "new key: %{http_code}\n" -m 60 "${MAAS_GW}/v1/chat/completions" \
+  -H "Authorization: Bearer ${NEMO_KEY}" -H "Content-Type: application/json" \
+  -d '{"model":"mistral-large","messages":[{"role":"user","content":"hi"}],"max_tokens":100}'
+
+# BOTH places
+oc delete secret nemo-upstream-key -n ${GR_NS}
+oc create secret generic nemo-upstream-key -n ${GR_NS} --from-literal=token="${NEMO_KEY}"
+oc get cm nemo-config -n ${GR_NS} -o json \
+  | jq --arg k "$NEMO_KEY" '.data["config.yaml"] |= sub("api_key: [^\n]*"; "api_key: " + $k)' \
+  | oc apply -f -
+
+oc delete pod -n ${GR_NS} --all
+```
+
+Rotate the ABSK key — two credentials per IAM user exist precisely to make this zero-downtime:
+
+```bash
+aws iam create-service-specific-credential --user-name rhoai-maas-bedrock \
+  --service-name bedrock.amazonaws.com --credential-age-days 90
+# validate: len 132, prefix ABSK, direct call to bedrock-mantle succeeds
+# then update the Secret, then delete the OLD credential
+```
+
+**Decide the fail mode before production.** When guardrails cannot reach their LLM, does the system fail *closed* (everything blocked) or *open* (everything through)? On the reference cluster a blocked NeMo returned an error rather than passing traffic — but this was not tested deliberately, and it is the single most important question a security team will ask.
+
+## H.2 Things that degrade with no operator action
+
+| What | Observed | Detection | Fix |
+|---|---|---|---|
+| **HTTPRoute patch reverts** (Appendix G §2, §10) | Held 1h, reverted within 24h. Every request `404` | `oc get httproute <m> -n ${MODEL_NS} -o jsonpath='{.spec.rules[3].matches[0].headers[0].value}'` — must equal `modelName` | Re-apply the §4.5b patch |
+| **Gateway replica goes stale** (Appendix G §6) | Both pods healthy one evening, ~10% `503` next morning at 25h uptime | Six-call loop; on ClusterIP+Route the 503 does **not** appear in the Envoy log | `oc rollout restart deployment/maas-default-gateway-data-science-gateway-class -n openshift-ingress` |
+| **In-cluster PostgreSQL is emptyDir** | Not observed, but structural | Pod restart | **Every issued analyst API key becomes invalid.** Use RDS or a PVC-backed instance for anything real |
+
+A combined health check, suitable for a CronJob or a monitor:
+
+```bash
+#!/usr/bin/env bash
+FAIL=0
+for m in bedrock-gpt-oss-20b mistral-large; do
+  got=$(oc get httproute $m -n external-models \
+    -o jsonpath='{.spec.rules[3].matches[0].headers[0].value}' 2>/dev/null)
+  [ "$got" = "$m" ] || { echo "HTTPROUTE DRIFT: $m is '$got'"; FAIL=1; }
+done
+codes=$(for i in 1 2 3 4 5 6; do
+  curl -sk -o /dev/null -w "%{http_code} " -m 60 "${MAAS_GW}/v1/chat/completions" \
+    -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" \
+    -d '{"model":"mistral-large","messages":[{"role":"user","content":"hi"}],"max_tokens":100}'
+done)
+echo "codes: $codes"
+[[ "$codes" =~ (503|404|401) ]] && { echo "INFERENCE DEGRADED"; FAIL=1; }
+exit $FAIL
+```
+
+## H.3 Minimum monitoring for production
+
+| Signal | Why |
+|---|---|
+| Inference success rate at the gateway | Catches stale replicas and route drift before users do |
+| Days remaining on every credential in H.1 | The only defence against the silent expiry class |
+| `maas-api` pod health | No key minting or revocation while it is down |
+| PostgreSQL availability and backups | Losing it invalidates every analyst key |
+| NeMo Guardrails pod health and error rate | A dead guardrail may fail open — see H.1 |
+| `MaaSModelRef` phase per model | Catches governance drift |
+| Token consumption per subscription | The chargeback signal, and an early warning on runaway spend |
+
+## H.4 What to hand an operations team
+
+- This runbook, with Appendix G (known defects) and this appendix
+- A filled-in Appendix F site record sheet
+- The credential inventory from H.1, with named owners and rotation dates
+- The H.2 health check, scheduled
+- The decision on fail-open vs fail-closed for guardrails
+- An escalation note: **external model routing is Tech Preview**, so support scope is limited
+
+## H.5 Scope caveat
+
+This is a proof of concept, not a supported architecture. Before production, at minimum: HA for the gateway and Limitador, a real database with backups, corporate TLS, the customer's IdP wired through `GatewayConfig`, a tightened IAM policy (§3.6), and a resolution for the two blockers in Appendix G. **The gateway is on the analyst critical path** — if it is down, analysts are down, which is a change from today where each holds their own AWS credential.
