@@ -13,12 +13,12 @@
 > | 3 — AWS Bedrock setup | ✅ **Verified** | Run end to end |
 > | 4 — Wire Bedrock into RHOAI | ✅ **Verified** | Run end to end, incl. two undocumented workarounds |
 > | 5 — Guardrails (NeMo) | ✅ **Verified** | Deployed and working: clean pass, PII blocked, jailbreak blocked, zero AWS calls when blocked |
-> | 6 — The demo | ⚠️ **Partly verified** | §6.0–6.3 verified. §6.4 (guardrails) is narrative only |
+> | 6 — The demo | ⚠️ **Partly verified** | All demos run. Metering cannot be shown — no telemetry configured (§6.3) |
 > | 7 — Troubleshooting | ✅ Verified | Every entry hit during the build |
 > | 8 — Cleanup | 📝 Untested | Not exercised |
 > | A–F — Appendices | ✅ Verified | Reflect the working cluster |
-| H — Day 2: what breaks later | ✅ Verified | Credential lifecycle and the two failures observed overnight |
-> | G — Undocumented findings | ✅ Verified | **May become stale — see below** |
+> | G — Undocumented findings | ✅ Verified | Cluster behaviour with evidence. **May become stale — see below** |
+> | H — Day 2: what breaks later | ✅ Verified | Credential lifecycle, and the two failures observed overnight |
 >
 > **Status meanings:** ✅ *Verified* — executed on the cluster below, worked. 📝 *Untested plan* — written from schema and docs, never run; treat as a starting point. ⚠️ *Partly verified* — mixed, marked inline.
 
@@ -2774,8 +2774,8 @@ Trade-off: detector thresholds rather than conversational logic, and it needs no
 
 > ## ⚠️ Partly verified
 >
-> **§6.0–6.3 and §6.5–6.7 are verified** — every command was run on the reference cluster.
-> **§6.4 (guardrails) is narrative only**, because Part 5 was never built. It gives you words to say, not something to demonstrate.
+> **All three demos have been run**, including guardrails (§6.4) now that Part 5 is built.
+> **One exception: metering.** Telemetry was never configured, so the observability dashboard has no data. §6.3 says what to show instead. Do not open that dashboard in front of a customer.
 
 Written against the **verified working state**. Every command here was run successfully on the reference cluster. Where something is not yet working, it says so.
 
@@ -2970,11 +2970,37 @@ Mint a new one and carry on.
 
 ### Metering
 
-**Console:** **Settings → MaaS governance** — show the subscriptions, their models, and the token limits.
+> ## ⚠ The observability dashboard has NO DATA on the reference cluster
+>
+> Telemetry was never configured. `MaasTenantConfig.spec.telemetry` is unset, the Cluster Observability Operator is not installed, and the only MaaS-related metric present in Prometheus is `limitador_up` — **no token metrics at all**.
+>
+> ```bash
+> oc get maastenantconfig default-tenant -n models-as-a-service -o jsonpath='{.spec.telemetry}'; echo
+> oc get csv -A | grep -i observability
+> ```
+>
+> **Do not open the Observability dashboard in a demo** and do not promise per-user or per-department charts. Enabling it needs §1.8 of the MaaS docs: `observabilityDashboard: true` (done in §2.9), the Cluster Observability Operator, metrics storage in the `DSCInitialization`, and `MaasTenantConfig.spec.telemetry` with `captureUser` / `captureGroup` / `captureOrganization` / `captureModelUsage`. **Not attempted here.**
 
-> "Every call is attributed to a user, a group, and a cost centre. That's the input to chargeback — and to noticing a runaway process before the invoice does."
+**What you can honestly show:**
 
-> **Note:** responses carry no `X-RateLimit-*` headers in 3.5 GA (Appendix G §5), so show the subscription definition rather than promising live quota headers. A live 429 was not verified — do not script it.
+**1. Token counts, live, per request.** Every response carries them, and they are real:
+
+```bash
+curl -sk -m 60 "${MAAS_GW}/v1/chat/completions" -H "Authorization: Bearer ${API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mistral-large","messages":[{"role":"user","content":"Say hello in 3 words."}],"max_tokens":300}' \
+  | jq '{model, usage}'
+```
+
+**2. The cost contrast** between models on the same prompt — 214 tokens on `bedrock-gpt-oss-20b`, 15 on `mistral-large`. That makes per-model metering a demonstrated fact rather than a claim.
+
+**3. The governance objects.** **Console: Settings → MaaS governance** — the subscriptions, their models, token limits, priorities, and the `costCenter` / `organizationId` metadata on each.
+
+> "Every call reports its token usage, and every subscription carries a cost centre. That is the input to chargeback. Aggregating it into dashboards is a configuration step — the data model is here, the reporting layer is the next piece of work."
+
+That framing is accurate and does not overclaim. Saying "here's the chargeback dashboard" when it is empty is the kind of thing a customer remembers.
+
+> **Also not available:** responses carry no `X-RateLimit-*` headers in 3.5 GA (Appendix G §5), and a live `429` was never triggered. Show the subscription's configured limits instead of promising either.
 
 ---
 
@@ -3207,7 +3233,7 @@ aws iam delete-service-specific-credential \
 [ ] Header stripping verified functionally (§6.5) — REQUIRED, version is unreadable
 [ ] Guardrails: clean prompt passes, PII blocked, jailbreak blocked
 [ ] Guardrails: blocked prompt produced ZERO AWS calls (counter unchanged)
-[ ] Token metrics visible per team
+[ ] Token counts shown from usage.total_tokens per response (NOT the dashboard — no data)
 ```
 
 ---
@@ -3673,9 +3699,13 @@ Other limitations from the same section worth carrying: cross-format translation
 
 Option 2 is the quicker route to a working Claude model, at the cost of a separate vendor contract. Note it also loses token rate limiting (finding 2c).
 
-## 5. No rate-limit headers on responses
+## 5. No rate-limit headers, and no token metrics without extra setup
 
-HTTPRoute status shows `kuadrant.io/TokenRateLimitPolicyAffected: True` and `MaaSSubscription` is Active, but responses carry no `X-RateLimit-*` headers. Quota demos need the observability dashboard instead of response headers. Enforcement itself is untested at the limit.
+HTTPRoute status shows `kuadrant.io/TokenRateLimitPolicyAffected: True` and `MaaSSubscription` is Active, but responses carry no `X-RateLimit-*` headers. Enforcement at the limit was never triggered, so a live `429` is unverified.
+
+**And the fallback is not available either.** With telemetry unconfigured, Prometheus holds only `limitador_up` — no token metrics — so the observability dashboard is empty. Between them, this leaves **no way to show quota state to a consumer**: not in response headers, not in a dashboard. Only `usage.total_tokens` per response, which the client sees but the platform does not aggregate.
+
+Enabling metering requires the Cluster Observability Operator, metrics storage in the `DSCInitialization`, and `MaasTenantConfig.spec.telemetry` with the `capture*` flags (docs §1.8). Not attempted on the reference cluster.
 
 ## 6. Gateway replicas go stale — two symptoms, and it recurs over time
 
