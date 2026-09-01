@@ -1,10 +1,47 @@
 # RHOAI 3.5 GA → AWS Bedrock via MaaS, with Guardrails
 
-**Step-by-step from a bare RHOAI 3.5 install to a three-part customer demo.**
+**Step-by-step from a bare RHOAI 3.5 install to a customer demo.**
 
-Verified against: OCP 4.22.10 on AWS · RHOAI 3.5.0 GA (`stable-3.5`) · RHCL 1.4.2 · Bedrock Mantle `us-east-1`
+> ## 🚧 Draft — status by part
+>
+> RHOAI 3.5 shipped days before this was written and its documentation still renders as EA. Parts of this runbook are verified on a live cluster; parts are a plan. **Check the status of the part you are reading before relying on it.**
+>
+> | Part | Status | Meaning |
+> |---|---|---|
+> | 1 — Where you are now | ✅ **Verified** | Run end to end |
+> | 2 — Platform prerequisites | ✅ **Verified** | Run end to end |
+> | 3 — AWS Bedrock setup | ✅ **Verified** | Run end to end |
+> | 4 — Wire Bedrock into RHOAI | ✅ **Verified** | Run end to end, incl. two undocumented workarounds |
+> | 5 — Guardrails | 📝 **Untested plan** | Written from docs and schema. **Not run.** Expect field names and images to be wrong |
+> | 6 — The demo | ⚠️ **Partly verified** | §6.0–6.3 verified. §6.4 (guardrails) is narrative only |
+> | 7 — Troubleshooting | ✅ Verified | Every entry hit during the build |
+> | 8 — Cleanup | 📝 Untested | Not exercised |
+> | A–F — Appendices | ✅ Verified | Reflect the working cluster |
+> | G — Undocumented findings | ✅ Verified | **May become stale — see below** |
+>
+> **Status meanings:** ✅ *Verified* — executed on the cluster below, worked. 📝 *Untested plan* — written from schema and docs, never run; treat as a starting point. ⚠️ *Partly verified* — mixed, marked inline.
 
----
+## Last verified
+
+| | |
+|---|---|
+| **Date** | 31 August 2026 |
+| OpenShift | 4.22.10 on AWS |
+| RHOAI | `rhods-operator.3.5.0` GA, channel `stable-3.5` |
+| MaaS / AI Gateway | MaaS v0.2.0, ai-gateway-operator 1.26.2 |
+| Connectivity Link | `rhcl-operator.v1.4.2` |
+| Bedrock | Mantle endpoint, `us-east-1` |
+| Working model | `openai.gpt-oss-20b`, `mistral.mistral-large-3-675b-instruct` |
+
+**Appendix G documents bugs in a release that is days old.** Any of them may be fixed in a 3.5.z patch, at which point a workaround here becomes unnecessary or actively wrong. Before applying one, check whether the symptom actually occurs. If a finding no longer reproduces, please update this document rather than leaving it to mislead the next reader.
+
+## Scope and caveats
+
+Written while building a proof of concept on a sandbox cluster, days after RHOAI 3.5 went GA. It is **not** a Red Hat product document and carries no support commitment. Where it disagrees with the official documentation, the official documentation is authoritative — except where this runbook explicitly records that the documented behaviour does not work (Appendix G), which was determined by testing.
+
+Environment-specific values are redacted as `<sandbox-id>`, `<gateway-ip>`, `<account-id>` and similar — see the redaction policy below. Substitute your own; never copy them.
+
+If you hit something this document gets wrong, it is probably worth raising with whoever pointed you here rather than working around it silently.
 
 ## 0. What you are building
 
@@ -44,7 +81,7 @@ The analyst never sees the AWS credential. That is the entire point.
 
 The orchestrator goes **in front of** the MaaS gateway: `client → orchestrator → MaaS gateway → Bedrock`.
 
-The alternative — pointing `ExternalModel.spec.endpoint` at an in-cluster orchestrator so guardrails sit *behind* MaaS — is fragile. The `bedrock-openai` provider builds a ServiceEntry and DestinationRule with TLS origination aimed at an external FQDN; aiming that at a cluster-local service is not what it is designed for. Do not build a customer demo on it.
+The alternative — pointing `ExternalModel.spec.endpoint` at an in-cluster orchestrator so guardrails sit *behind* MaaS — is fragile. The provider builds a ServiceEntry and DestinationRule with TLS origination aimed at an external FQDN; aiming that at a cluster-local service is not what it is designed for. Do not build a customer demo on it.
 
 The usual objection to orchestrator-in-front is that an analyst could bypass guardrails by calling the MaaS URL directly. That is solved at the authorization layer rather than with topology: scope the direct lane's `MaaSAuthPolicy` to the orchestrator's ServiceAccount only, and give the analyst group access to the guardrailed lane. It also demos well — the bypass attempt returns 403 on camera.
 
@@ -59,6 +96,7 @@ The usual objection to orchestrator-in-front is that an analyst could bypass gua
 | **The deprecated field is one-directional.** | CEL allows `Managed→Removed` but blocks `Removed→Managed`. You cannot fall back to the old path. |
 | **Docs lag the GA release.** | At time of writing the 3.5 doc set still renders "EA2" titles. Trust the cluster's CRDs over any document, including this one. |
 | **Use `bedrock-mantle`, not `bedrock-runtime`.** | The payload processor calls `/v1/chat/completions`, which only exists on the Mantle endpoint. |
+| **Two undocumented workarounds are required.** | The Secret label (§4.2) and the generated HTTPRoute (§4.5b). Without both, external models cannot work. See Appendix G. |
 
 ### Reference material
 
@@ -2289,6 +2327,18 @@ Save the key — Parts 5 and 6 use it. Record `MAAS_GW` in Appendix F.
 
 # PART 5 — Guardrails
 
+> ## 📝 UNTESTED — this part is a plan, not a procedure
+>
+> Nothing in Part 5 has been run. It is written from the 3.5 CRD schemas and Red Hat's guardrails documentation, and the architecture reasoning is sound — but expect at least some of these to be wrong:
+>
+> - `GuardrailsOrchestrator` field names (the API has moved between releases, and the 3.5 docs still render as EA)
+> - The detector runtime and model image references — Red Hat has shipped these under several registry paths
+> - The exact orchestrator ConfigMap shape
+>
+> **Before following it:** `oc explain guardrailsorchestrator.spec --recursive`, and cross-check against `.../3.5/html/enabling_ai_safety_with_guardrails/index`. Treat the CRs here as a starting shape, not a working manifest.
+>
+> Part 4 is verified; this is where the verified material ends.
+
 Part 4 gave you **access** control: who can call, how much, revocable. Part 5 adds **content** control: what may be sent and what may come back.
 
 For a customer sending analyst queries from Israel to a US-region Bedrock endpoint, "PII never leaves the cluster" is a stronger data-residency answer than anything in Part 4.
@@ -2613,6 +2663,11 @@ Demo it: the analyst's key against the direct MaaS URL now returns **403**, and 
 
 # PART 6 — The demo
 
+> ## ⚠️ Partly verified
+>
+> **§6.0–6.3 and §6.5–6.7 are verified** — every command was run on the reference cluster.
+> **§6.4 (guardrails) is narrative only**, because Part 5 was never built. It gives you words to say, not something to demonstrate.
+
 Written against the **verified working state**. Every command here was run successfully on the reference cluster. Where something is not yet working, it says so.
 
 ---
@@ -2916,6 +2971,8 @@ oc describe datasciencecluster default-dsc
 
 # PART 8 — Cleanup
 
+> 📝 **Untested.** Written for completeness; not exercised. Check what a delete cascades to before running it on anything you care about.
+
 Remove the Bedrock integration, leave MaaS standing:
 
 ```bash
@@ -3071,6 +3128,8 @@ Notes for a multi-provider design:
 - The long-term ABSK key is a long-lived credential with an expiry. Someone must own its rotation. Two keys per IAM user exist precisely to make zero-downtime rotation possible — build the runbook for it now, not after the first expiry incident.
 
 # Appendix D — Manual Gateway creation (3.4-era fallback only)
+
+> 📝 **Superseded and untested on 3.5.** §2.5 replaces this. Kept only for 3.4-era clusters.
 
 > **Do not use this on RHOAI 3.5 GA.** The platform creates and owns the Gateway via `GatewayConfig` (§2.5).
 > This procedure is kept for 3.4-era clusters, and for sites that genuinely need a second, separately-managed
