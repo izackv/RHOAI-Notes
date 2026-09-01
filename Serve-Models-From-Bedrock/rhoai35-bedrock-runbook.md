@@ -100,11 +100,23 @@ The usual objection to orchestrator-in-front is that an analyst could bypass gua
 
 ### Reference material
 
-- Official 3.5 doc set: `https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5`
-- MaaS: `.../3.5/html/govern_llm_access_with_models-as-a-service/index`
-- Guardrails: `.../3.5/html/enabling_ai_safety_with_guardrails/index`
-- Supported Configurations (per-component TP/GA status): `https://access.redhat.com/articles/rhoai-supported-configs-3.x`
-- Companion field guide (Kustomize + scripts): `https://rh-aiservices-bu.github.io/rhoai-maas-guide/`
+**Official Red Hat documentation (verified accessible, RHOAI 3.5 GA):**
+
+| Topic | Link |
+|---|---|
+| 3.5 documentation index | https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5 |
+| Release notes (TP/DP status, known issues) | https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/release_notes/index |
+| **Govern LLM access with Models-as-a-Service** — the primary reference for Parts 2 and 4 | https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/govern_llm_access_with_models-as-a-service/deploy-and-manage-models-as-a-service |
+| Ensuring AI safety with guardrails — Part 5 | https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/enabling_ai_safety_with_guardrails |
+| Installing and uninstalling | https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/installing_and_uninstalling_openshift_ai_self-managed/installing-and-deploying-openshift-ai_install |
+| Disconnected / air-gapped install | https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/installing_and_uninstalling_openshift_ai_self-managed_in_a_disconnected_environment/index |
+| Managing OpenShift AI (admin) | https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/managing_openshift_ai/index |
+| Supported Configurations (per-component TP/GA) | https://access.redhat.com/articles/rhoai-supported-configs-3.x |
+| Product life cycle | https://access.redhat.com/support/policy/updates/rhoai-sm/lifecycle |
+| Companion field guide (Kustomize + scripts) — referenced *by* the official docs | https://rh-aiservices-bu.github.io/rhoai-maas-guide/ |
+
+Key MaaS sections, by anchor on the `deploy-and-manage-models-as-a-service` page:
+`#maas-prerequisites_maas-deploy` (1.2) · `#maas-gateway-requirements_maas-deploy` (1.3) · `#configure-tls-for-maas_maas-deploy` (1.4) · `#configure-postgresql-secret-for-maas_maas-deploy` (1.5) · `#maas-configuration_maas-deploy` (1.6) · `#maas-dashboard-configuration_maas-deploy` (1.7) · `#configuring-maas-external-models_maas-deploy` (1.21) · `#maas-administration-troubleshooting_maas-deploy` (1.22)
 
 ### Redaction policy for this document
 
@@ -813,11 +825,15 @@ oc new-app --name=maas-postgres \
 oc rollout status deployment/maas-postgres -n maas-db --timeout=300s
 ```
 
-Create the secret in the **RHOAI applications namespace**:
+Create the secret in the **infrastructure namespace**. Per the official docs (§1.5), this is `redhat-ai-gateway-infra` in OpenShift AI 3.5 and later — **not** `redhat-ods-applications`, which was the 3.4 location. Determine it from the cluster rather than assuming:
 
 ```bash
+export INFRA_NS=$(oc get maastenantconfig default-tenant -n models-as-a-service \
+  -o jsonpath='{.status.infraNamespace}' 2>/dev/null || echo redhat-ai-gateway-infra)
+echo "infra namespace: $INFRA_NS"
+
 oc create secret generic maas-db-config \
-  -n redhat-ods-applications \
+  -n ${INFRA_NS} \
   --from-literal=DB_CONNECTION_URL="postgresql://maas:${PGPASS}@maas-postgres.maas-db.svc.cluster.local:5432/maas?sslmode=disable"
 
 oc get secret maas-db-config -n redhat-ods-applications
@@ -850,7 +866,9 @@ The masked URL must have exactly one `@` and no extra `/` or `:` inside the mask
 
 **Console:** **Workloads → Secrets → Create → Key/value secret**, project `redhat-ods-applications`, name `maas-db-config`, key `DB_CONNECTION_URL`.
 
-> Namespace matters: `redhat-ods-applications` (RHOAI), not `opendatahub` (ODH). Wrong namespace = `secret not found` in the maas-api logs.
+> **Namespace matters, and it moved in 3.5.** The docs specify the infrastructure namespace (`redhat-ai-gateway-infra` by default). On the reference cluster the secret was created in `redhat-ods-applications` and MaaS still came up — a copy appeared in the infra namespace — but follow the documented location. Wrong namespace shows as `secret not found` in the maas-api logs.
+>
+> Chicken-and-egg: `redhat-ai-gateway-infra` and the `MaasTenantConfig` do not exist until MaaS is enabled (§2.8). Either create the secret after §2.8 and `oc rollout restart deployment/maas-api -n ${INFRA_NS}`, or create the namespace up front. The docs note the restart is unnecessary if the secret pre-exists.
 
 ## 2.7 Apply the DataScienceCluster
 
@@ -1694,14 +1712,14 @@ oc get secret bedrock-api-key -n ${MODEL_NS} -o jsonpath='{.data.api-key}' | bas
 # 132
 ```
 
-> ## ⚠ The documented Secret label is WRONG in 3.5 GA
+> ## ⚠ Use the right Secret label — earlier revisions of this runbook had it wrong
 >
 > | | |
 > |---|---|
-> | **Required** | `inference.llm-d.ai/ipp-managed=true` |
-> | Documented (3.4-era, inert) | `inference.networking.k8s.io/bbr-managed=true` |
+> | **Required — and documented in 3.5 §1.21.4** | `inference.llm-d.ai/ipp-managed=true` |
+> | Wrong, from 3.4-era community sources | `inference.networking.k8s.io/bbr-managed=true` |
 >
-> The payload processor's `apikey-injection-secret-watcher` only caches Secrets carrying `inference.llm-d.ai/ipp-managed`. With the documented label the Secret is silently ignored and every inference call fails:
+> This label is **documented** in the official 3.5 docs (§1.21.4) — earlier revisions of this runbook used `inference.networking.k8s.io/bbr-managed`, which came from 3.4-era community sources and is inert. The payload processor's `apikey-injection-secret-watcher` only caches Secrets carrying `inference.llm-d.ai/ipp-managed`. Without it the Secret is silently ignored and every inference call fails:
 >
 > ```
 > HTTP 500  inference error: Internal - authType 'apikey' credentials not found
@@ -3032,7 +3050,7 @@ aws iam delete-service-specific-credential \
 [ ] §2.5 Listener hostname IS maas.<cluster-domain> (the UI hardcodes it — any other value breaks the console)
 [ ] §2.5 Gateway restarted after any listener/Service change, six-call loop clean
 [ ] §2.5 redhat-ods-applications labelled maas.opendatahub.io/gateway-access=true
-[ ] §2.6 PostgreSQL running; maas-db-config in redhat-ods-applications
+[ ] §2.6 PostgreSQL running; maas-db-config in the INFRA namespace (redhat-ai-gateway-infra)
 [ ] §2.7 DSC applied and Ready; dashboard reachable (both classic Route and $MAAS_GW)
 [ ] §2.7 Workbench smoke test passed — notebook runs AND has egress (reused in §6.2)
 [ ] §2.8 aigateway + modelsAsAService Managed  (spelling: AsA)
@@ -3418,16 +3436,45 @@ Fill this in once per environment, as you work through Part 2. Parts 4–6 read 
 
 # Appendix G — Undocumented 3.5 GA findings (bug report material)
 
-Discovered by trial and binary inspection on `rhods-operator.3.5.0` GA, MaaS v0.2.0, ai-gateway-operator 1.26.2, RHCL 1.4.2. **None of these appear in the product documentation.** Raise them with the RHOAI team.
+Discovered by trial and binary inspection on `rhods-operator.3.5.0` GA, MaaS v0.2.0, ai-gateway-operator 1.26.2, RHCL 1.4.2.
 
-## 1. The Secret label is wrong in the docs
+**Every finding below is observed cluster behaviour with evidence.** Where a finding is also compared against the official documentation, that comparison is marked ✅ *verified against docs* or ⚠️ *not verified*. The distinction matters for a bug report: "this does not work as expected" and "the documentation is wrong" are different claims.
+
+Docs consulted: `.../3.5/html/govern_llm_access_with_models-as-a-service/deploy-and-manage-models-as-a-service`, sections 1.1–1.13. **Section 1.21 (Configure external models) could not be retrieved** — it sits beyond the page fetch limit — so anything about how external model credentials are *documented* remains unverified.
+
+## 0. Documentation defects — ✅ verified against the official 3.5 docs
+
+Both of these were confirmed by reading the published 3.5 GA documentation and comparing against the CRDs on the cluster.
+
+**0a. §1.6 documents a deprecated, unusable field.** The docs say:
+
+> *"Set `spec.components.kserve.modelsAsService.managementState` to `Managed` in the `DataScienceCluster` custom resource."*
+
+On 3.5 GA that field's own CRD description reads *"Deprecated: … MaaS is now configured via `spec.components.aigateway.modelsAsAService`"*, and a CEL rule blocks `Removed→Managed`. On a fresh install the field is unset, so **following the official documentation cannot enable MaaS.** Use `aigateway.modelsAsAService` (§2.8).
+
+**0b. §1.7 documents a flag the API rejects.** The docs say to set `spec.dashboardConfig.maasAuthPolicies` to `true`. The CRD marks it DEPRECATED and CEL rejects the write:
+
+```
+Invalid value: "object": no such key: maasAuthPolicies evaluating rule:
+DEPRECATED: spec.dashboardConfig.maasAuthPolicies must be removed or left unchanged.
+```
+
+Rejection is atomic, so including it silently prevents every other dashboard flag from applying (§2.9).
+
+**0c. Gap, not a defect:** §1.2 lists *"You have enabled distributed inference with llm-d, including authentication for LLM Inference Service"* as a prerequisite. This runbook does not cover it, and MaaS worked without an explicit step — but it is documented as required and should be checked at a customer site.
+
+## 1. The Secret label — ✅ RESOLVED: docs are correct, this runbook was wrong
+
+> **NOT a product defect — do not file this.** Section 1.21.4 documents the label correctly as `inference.llm-d.ai/ipp-managed: "true"`, in the model namespace, data key `api-key`, type `Opaque`, with the exact `oc label` command. **This runbook had it wrong**, inherited from 3.4-era community sources that predate the rename. Kept here because the failure mode is worth knowing, not as a bug report.
 
 | | |
 |---|---|
-| **Required** | `inference.llm-d.ai/ipp-managed=true` |
-| Documented (inert) | `inference.networking.k8s.io/bbr-managed=true` |
+| **Correct — documented in §1.21.4 and verified on cluster** | `inference.llm-d.ai/ipp-managed=true` |
+| Wrong, from 3.4-era sources | `inference.networking.k8s.io/bbr-managed=true` — inert |
 
-`apikey-injection-secret-watcher` only caches Secrets carrying the first. With the documented label, every inference call returns:
+**Lesson:** when a community guide and the product docs disagree on 3.5, the product docs won. Read §1.21.4 before trusting any external source on external models.
+
+`apikey-injection-secret-watcher` only caches Secrets carrying the required label. With the documented label, every inference call returns:
 
 ```
 HTTP 500  inference error: Internal - authType 'apikey' credentials not found
@@ -3439,7 +3486,13 @@ Silent: no RBAC error, no warning, no status condition. The `ExternalProvider` s
 
 **Ruled out during diagnosis:** RBAC (ClusterRole `payload-processing-reader` grants full access to `inference.opendatahub.io` and Secrets; verified with the SA token from inside the pod); the `api-key` vs `apiKey` data-key name; placing the Secret in `openshift-ingress` or `models-as-a-service`; model-level `auth` overrides; IPP restarts.
 
-## 2. The generated HTTPRoute cannot match any request
+## 2. The generated HTTPRoute header mismatch — ⚠️ status uncertain after reading §1.21.3.7
+
+**The documented routing model differs from what we worked around.** §1.21.3.7 describes body-based routing: a pre-auth `ext_proc` filter extracts `model` from the request body and sets `X-Gateway-Model-Name`, then resolution proceeds `X-Gateway-Model-Name` → body `model` → `ExternalModel.spec.modelName` → `ExternalModel.metadata.name`. The header is generated internally; clients never send it.
+
+`x-ipp-selected-provider` — the header the generated HTTPRoute matched on in our cluster — **does not appear anywhere in the documentation**. It is internal.
+
+We observed `404 route_not_found` until patching rule 3's `X-Gateway-Model-Name` from `targetModel` to `modelName`, and the patch made inference work. But given the documented resolution order should have matched `modelName` anyway, the root cause may be different from my original diagnosis. **Re-test on a clean model without the patch before filing this**, and note §1.21.3.8's remark that an unmatched body `model` can escape the routing pipeline and produce a downstream routing error rather than a clean not-found.
 
 The controller sets the catch-all rule's `X-Gateway-Model-Name` header match to **`targetModel`**:
 
@@ -3458,11 +3511,32 @@ They can never match → `404 route_not_found` at Envoy for every request. Manua
 
 Note this bug is **masked** by bug 1: while credential injection aborts, IPP never rewrites the path, so Envoy's original path match holds and requests reach AWS. Fixing the label exposes the routing bug — which is why the symptom changed from 500 to 404 mid-diagnosis.
 
+## 2b. AWS Bedrock is under-documented — ✅ verified gap
+
+§1.21 names Bedrock as a supported provider and specifies `auth.type: sigv4` (MaaS signs the whole request with AWS credentials from the Secret), but does **not** document:
+
+- the Bedrock endpoint hostname — neither `bedrock-mantle.<region>.api.aws` nor `bedrock-runtime.<region>.amazonaws.com` appears anywhere in the section
+- the `sigv4` Secret schema — no AWS key names, no region field, no example
+- `apiFormat` or `path` for Bedrock
+- whether the `ipp-managed` label is also required on a `sigv4` Secret
+
+Worked examples exist for OpenAI and Anthropic only. **Everything this runbook documents about Bedrock was determined by testing**, not from the docs.
+
+> **This runbook uses `auth.type: apikey` with a Bedrock ABSK bearer key against `bedrock-mantle`.** That is not the documented Bedrock path — the docs point to `sigv4`. It works for OpenAI-format models (verified), and it is plausibly why Anthropic-on-Bedrock fails (finding 4). Investigating `sigv4` is the first thing to try for a production build.
+
+## 2c. Token rate limiting does NOT apply to passthrough formats — ✅ documented, easy to miss
+
+§1.21.3.8: MaaS subscription token rate limiting is **not enforced** for `apiFormat: messages` or `openai-responses`, because metering is tied to OpenAI Chat Completions' `usage.total_tokens`. Provider-side limits must be used instead.
+
+**Consequence for the demo and for customers:** the quota story only holds for `openai-chat`. If a customer wants Anthropic passthrough to preserve prompt caching or extended thinking, they lose MaaS quota enforcement on those models. Say this out loud — it is a genuine architectural trade-off, not a detail.
+
+Other limitations from the same section worth carrying: cross-format translation buffers streaming rather than delivering tokens incrementally; payloads over **16 KB** can be truncated by a Kuadrant WASM issue fixed in Service Mesh 3.3.1+; unsupported API paths return 400; NeMo Guardrails response guards cannot inspect non-OpenAI-format responses.
+
 ## 3. `ExternalProvider` reports Ready without validating the credential
 
 `phase: Ready`, `"All resources created successfully"` — while the referenced Secret is invisible to the component that needs it. A condition reflecting whether the credential was actually loaded would have saved hours.
 
-## 4. Anthropic models on Bedrock Mantle: format unresolved
+## 4. Anthropic on Bedrock: unresolved — but the docs suggest why
 
 `anthropic.claude-sonnet-5` with `apiFormat: openai-chat` returns:
 
@@ -3471,7 +3545,14 @@ Note this bug is **masked** by bug 1: while credential injection aborts, IPP nev
  "message":"The model 'anthropic.claude-sonnet-5' does not support the '/v1/chat/completions' API"}}
 ```
 
-`apiFormat: messages` + `path: /v1/messages` returns 404 from AWS. Correct Mantle path for Anthropic-native format not determined. OpenAI-family models work.
+`apiFormat: messages` + `path: /v1/messages` returns 404 from AWS. OpenAI-family models work.
+
+**What §1.21 adds:** the documented `messages`/`/v1/messages` combination is for **direct Anthropic** (`provider: anthropic`, `endpoint: api.anthropic.com`), not for Anthropic models via Bedrock. And Bedrock's documented auth type is `sigv4`, not the `apikey` we used. Two hypotheses to test, in order:
+
+1. **`auth.type: sigv4`** with AWS access keys instead of the ABSK bearer key — the documented Bedrock path
+2. **Direct Anthropic** — `provider: anthropic`, `endpoint: api.anthropic.com`, `apiFormat: messages`, `path: /v1/messages`, which is fully documented and needs only an Anthropic API key
+
+Option 2 is the quicker route to a working Claude model, at the cost of a separate vendor contract. Note it also loses token rate limiting (finding 2c).
 
 ## 5. No rate-limit headers on responses
 
@@ -3481,7 +3562,9 @@ HTTPRoute status shows `kuadrant.io/TokenRateLimitPolicyAffected: True` and `Maa
 
 After changing the gateway Service type or listener hostname, one replica may serve stale upstream config: ~50% of calls return `503 UC,DC` after ~60s while the rest succeed in <1s. Distinguishable by pod IP in the Envoy access log. `oc rollout restart` fixes it. Worth an automatic reconcile.
 
-## 7. The MaaS hostname is NOT configurable in practice
+## 7. The MaaS hostname is NOT configurable in practice — ✅ consistent with docs
+
+The official verification procedure uses `HOST="maas.$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')"`, confirming `maas.<cluster-domain>` as the expected hostname. The defect is that the UI *hardcodes* it while `AITenant.spec.gateway.name` and the Gateway listener suggest it is configurable.
 
 `AITenant.spec.gateway.name` lets you name the Gateway, and the Gateway listener hostname is yours to set — but **the MaaS UI hardcodes `maas.<cluster-domain>`**. It derives the API URL from the naming convention, not from the listener or from `MaaSModelRef.status.endpoint`.
 
