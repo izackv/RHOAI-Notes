@@ -13,9 +13,10 @@
 > | 3 — AWS Bedrock setup | ✅ **Verified** | Run end to end |
 > | 4 — Wire Bedrock into RHOAI | ✅ **Verified** | Run end to end, incl. two undocumented workarounds |
 > | 5 — Guardrails (NeMo) | ✅ **Verified** | Deployed and working: clean pass, PII blocked, jailbreak blocked, zero AWS calls when blocked |
-> | 6 — The demo | ⚠️ **Partly verified** | All demos run. Metering cannot be shown — no telemetry configured (§6.3) |
-> | 7 — Troubleshooting | ✅ Verified | Every entry hit during the build |
-> | 8 — Cleanup | 📝 Untested | Not exercised |
+> | 6 — Observability | ⚠️ **Partly verified** | Token metering working (§6.3). Dashboards blocked by a COO namespace bug (§6.4); Loki audit path not installed (§6.6) |
+> | 7 — The demo | ✅ **Verified** | All three demos run, including live token metering |
+> | 8 — Troubleshooting | ✅ Verified | Every entry hit during the build |
+> | 9 — Cleanup | 📝 Untested | Not exercised |
 > | A–F — Appendices | ✅ Verified | Reflect the working cluster |
 > | G — Undocumented findings | ✅ Verified | Cluster behaviour with evidence. **May become stale — see below** |
 > | H — Day 2: what breaks later | ✅ Verified | Credential lifecycle, and the two failures observed overnight |
@@ -114,7 +115,7 @@ The guardrails service sits **in front of** the MaaS gateway: `client → NeMo �
 
 The alternative — running guardrails **inside** the gateway as IPP plugins (`nemo-request-guard` / `nemo-response-guard`, which exist in the payload-processing binary) — is architecturally better because no bypass is possible. It is undocumented; see §5.7.
 
-With guardrails in front, an analyst can skip them by calling the MaaS URL directly. That is closed at the authorization layer rather than with topology: scope the direct lane's `MaaSAuthPolicy` to the orchestrator's ServiceAccount. **Do this after the governance demo, not before** — §6.3's checks depend on the direct lane working. Full reasoning and the three-state model in §5.6.
+With guardrails in front, an analyst can skip them by calling the MaaS URL directly. That is closed at the authorization layer rather than with topology: scope the direct lane's `MaaSAuthPolicy` to the orchestrator's ServiceAccount. **Do this after the governance demo, not before** — §7.3's checks depend on the direct lane working. Full reasoning and the three-state model in §5.6.
 
 ### Facts worth knowing before you start
 
@@ -466,7 +467,7 @@ On RHCL 1.4.2 the schema is `v1beta1` with three top-level areas. Two are not us
 | Field | What it does | Decision |
 |---|---|---|
 | `spec.mtls.{enable,authorino,limitador}` | Mutual TLS between the gateway and the Kuadrant data plane | **Off for the PoC.** This is a *different* mechanism from the Authorino server-cert TLS configured below — that one is required, this one is defence in depth. Raise it for the customer build: it is a supported field, not a workaround, and a security team may require it. Enabling it adds another failure surface, so do not turn it on while first bringing MaaS up. |
-| `spec.observability.tracing.defaultEndpoint` | OpenTelemetry trace export | Optional. Gives you spans across Authorino → Limitador → IPP → AWS in one trace, alongside the token metrics. Useful when the customer asks "where did the latency go?" Add after Part 6 works. |
+| `spec.observability.tracing.defaultEndpoint` | OpenTelemetry trace export | Optional. Gives you spans across Authorino → Limitador → IPP → AWS in one trace, alongside the token metrics. Useful when the customer asks "where did the latency go?" Add after Part 7 works. |
 | `spec.components.developerPortal.enabled` | Kuadrant developer portal | Not used here. |
 
 ### Verify
@@ -481,7 +482,7 @@ Authorino, Limitador, and the Kuadrant operator should be Running.
 
 > **You cannot read the Authorino runtime version, so do not try.** Red Hat's build strips the ldflags, so the startup log reports `"version":"unknown","commit":"unknown"`, and the image is pinned by digest (`registry.redhat.io/rhcl-1/authorino-rhel9@sha256:...`) with no readable tag. `relatedImages` on the CSV gives the same digest.
 >
-> Header stripping — the mechanism that stops the analyst's token reaching AWS — requires Authorino 0.23.1+. RHCL 1.4.2 is well past that, but since the version is unverifiable, **confirm it functionally in Part 6 (§6.5)** by proving the upstream never receives the caller's Authorization header. Do not treat the `authorino-operator` CSV version as evidence: that is a different version line from the runtime.
+> Header stripping — the mechanism that stops the analyst's token reaching AWS — requires Authorino 0.23.1+. RHCL 1.4.2 is well past that, but since the version is unverifiable, **confirm it functionally in Part 7 (§7.5)** by proving the upstream never receives the caller's Authorization header. Do not treat the `authorino-operator` CSV version as evidence: that is a different version line from the runtime.
 
 ### If the Kuadrant CR fails
 
@@ -1007,7 +1008,7 @@ Reading the pod list, three things surprise people coming from 3.4:
 
 ### Smoke-test a workbench — do this BEFORE enabling MaaS
 
-This is the gate between "RHOAI is installed" and "MaaS is added." If workbenches work now and break later, you know what changed. The workbench you create here is reused for Demo 1 in §6.2, so this is not throwaway work.
+This is the gate between "RHOAI is installed" and "MaaS is added." If workbenches work now and break later, you know what changed. The workbench you create here is reused for Demo 1 in §7.2, so this is not throwaway work.
 
 **Pre-checks:**
 
@@ -1047,7 +1048,7 @@ Settings                  → Cluster settings
 | **Name and description** | `bedrock-demo-wb` |
 | **Workbench image** | `Jupyter \| Data Science \| CPU \| Python 3.12`, **Version selection: 3.5** (Python v3.12). Images are versioned in 3.5 — take the newest. |
 | **Deployment size** | **Hardware profile: `default-profile`** — 2 CPU / 4 GiB. **Take the default; do not customize.** Ample for a notebook that pip-installs `openai` and makes HTTPS calls. |
-| **Environment variables** | Skip. §6.2 pastes the MaaS key into the notebook. *(For a polished demo you could inject it from a Secret here instead.)* |
+| **Environment variables** | Skip. §7.2 pastes the MaaS key into the notebook. *(For a polished demo you could inject it from a Secret here instead.)* |
 | **Cluster storage** | 20 GiB on the default StorageClass — usually prefilled |
 | **Connections** | Skip. This is for S3/model connections; there are none in this scenario. |
 
@@ -1072,13 +1073,13 @@ oc get imagestream -n redhat-ods-applications \
 | Part 5 guardrails work | `Jupyter \| TrustyAI \| CPU \| Python 3.12` | `odh-trustyai-notebook` |
 | VS Code instead of Jupyter | `Code Server \| Data Science \| CPU \| Python 3.12` | `code-server-notebook` |
 
-**Requirements are modest:** Python 3.x with `pip`, CPU-only. §6.2 installs the `openai` package and makes HTTPS calls — that is the entire workload.
+**Requirements are modest:** Python 3.x with `pip`, CPU-only. §7.2 installs the `openai` package and makes HTTPS calls — that is the entire workload.
 
 **Avoid anything containing CUDA, ROCm, or Gaudi.** There is nothing to schedule against on a GPU-less cluster, they pull many GB for no benefit, and accelerator variants can sit Pending waiting for resources that do not exist.
 
 > The `runtime-*` imagestreams with no display name are **pipeline runtimes, not workbench images**. They will not appear in the workbench picker. Ignore them.
 
-> There is also a **Start basic workbench** button at the top right of the Projects page, which spins one up without creating a project. Fine for a quick check, but create the project — §6.2 and the demo narrative both assume it.
+> There is also a **Start basic workbench** button at the top right of the Projects page, which spins one up without creating a project. Fine for a quick check, but create the project — §7.2 and the demo narrative both assume it.
 
 #### Option B — CLI
 
@@ -1114,7 +1115,7 @@ print(sys.version)
 print(requests.get("https://api.github.com", timeout=5).status_code)
 ```
 
-Python version plus `200` confirms the notebook runs **and has egress** — which it needs to reach the MaaS gateway in §6.2. A hang or connection error here means network policy or a proxy, and it is much easier to diagnose now than when it looks like a MaaS failure later.
+Python version plus `200` confirms the notebook runs **and has egress** — which it needs to reach the MaaS gateway in §7.2. A hang or connection error here means network policy or a proxy, and it is much easier to diagnose now than when it looks like a MaaS failure later.
 
 | Symptom | Cause |
 |---|---|
@@ -1122,7 +1123,7 @@ Python version plus `200` confirms the notebook runs **and has egress** — whic
 | ImagePullBackOff | Imagestreams still importing, or a pull-secret problem |
 | No images offered in the form | Imagestreams not yet imported — wait and reload |
 | Project missing from the dashboard | Namespace lacks `opendatahub.io/dashboard=true`, or an active filter chip on the Projects page |
-| Notebook starts, `requests` call hangs | Egress blocked. Resolve before §6.2 |
+| Notebook starts, `requests` call hangs | Egress blocked. Resolve before §7.2 |
 
 
 ## 2.8 Enable MaaS
@@ -1200,7 +1201,7 @@ oc logs -n redhat-ods-applications deployment/maas-controller --tail=40
 | Health returns dashboard HTML | Called the wrong gateway | `MAAS_GW` must be `maas.<domain>`, not `rh-ai.<domain>` |
 | `oc get modelsasservice` empty | Not an error | MaaS is a sub-component of `AIGateway`. Use `oc get aigateway -A` |
 
-> **`maas-api` logs every request with an `auth_headers` field** — `Authorization=absent X-Api-Key=absent Cookie=absent ...`. That is the header-stripping evidence used in §6.5, available with no extra setup.
+> **`maas-api` logs every request with an `auth_headers` field** — `Authorization=absent X-Api-Key=absent Cookie=absent ...`. That is the header-stripping evidence used in §7.5, available with no extra setup.
 
 ### Record in Appendix F
 
@@ -1230,7 +1231,7 @@ oc get crd odhdashboardconfigs.opendatahub.io -o yaml | grep -i -B2 -A6 'DEPRECA
 | `modelAsService` | Models-as-a-Service UI | Part 4 |
 | **`externalModels`** | **External model management UI** | **Part 4 — easy to miss** |
 | **`guardrails`** | **Guardrails UI** | **Part 5** |
-| `observabilityDashboard` | Token metering / observability | §6.3 |
+| `observabilityDashboard` | Token metering / observability | §7.3 |
 | `genAiStudio` | GenAI Studio playground | Only if `llamastackoperator: Managed` |
 | `vLLMDeploymentOnMaaS` | Deploy vLLM models through MaaS | Not needed for Bedrock. Relevant if the customer wants on-prem and external models behind one gateway |
 
@@ -1801,7 +1802,7 @@ oc describe externalprovider bedrock-${AWS_REGION} -n ${MODEL_NS}
 
 ## 4.4 ExternalModels
 
-Two models — you need a second for the model-swap demo in §6.2.
+Two models — you need a second for the model-swap demo in §7.2.
 
 ```bash
 cat <<EOF | oc apply -f -
@@ -2111,7 +2112,7 @@ Reference results, same prompt:
 - **Token count for a trivial prompt.** Reasoning models spend hundreds before answering. `gpt-oss-20b` used 214 tokens on a three-word greeting; mistral used 15. Those tokens are billed and metered, so a reasoning model muddies any cost or quota story.
 - **`content` is not null.** Reasoning models return `finish_reason: "length"` with `content: null` when `max_tokens` is too low — looks broken, isn't. Test at 300.
 - **Reasoning leaking into `content`.** Nemotron returned its entire monologue as the answer. Fine for a chatbot, terrible in a demo.
-- **Vendor diversity.** For the §6.2 model-swap moment, a different vendor makes the portability point far better than another model from the same family.
+- **Vendor diversity.** For the §7.2 model-swap moment, a different vendor makes the portability point far better than another model from the same family.
 - **Anthropic models reject `openai-chat`** on Mantle and the Messages path is unresolved (Appendix G §4).
 
 ### Step 2 — Register it
@@ -2187,11 +2188,11 @@ Reference: `{"content": "\"Hey there, friend!\"", "tokens": 17}` — Ready in 49
 
 Adding a model touched **no AWS resource, no new credential, no client change**. Same `ExternalProvider`, same ABSK key, same analyst API key. Two CRs and two patches, and every analyst on that subscription can use it immediately by changing one string.
 
-Note the cost contrast for §6.3: the same prompt costs **214 tokens on `gpt-oss-20b` and 15 on `mistral-large`** — 14×. That is a live argument for per-model metering, and it lands better than a slide.
+Note the cost contrast for §7.3: the same prompt costs **214 tokens on `gpt-oss-20b` and 15 on `mistral-large`** — 14×. That is a live argument for per-model metering, and it lands better than a slide.
 
 ## 4.6 Access policy and quota
 
-These live in **`models-as-a-service`**, not the model namespace. Two tiers, so §6.3 can exhaust one on camera.
+These live in **`models-as-a-service`**, not the model namespace. Two tiers, so §7.3 can exhaust one on camera.
 
 ```bash
 cat <<EOF | oc apply -f -
@@ -2684,13 +2685,13 @@ Neither is a defect. They are the two doors you close, in sequence, as the custo
 | **2. Governed** | A MaaS API key only | **No** — AWS key revoked | Yes |
 | **3. Guarded** | A MaaS API key only | No | **No** |
 
-**Do not close bypass B before the governance demo.** State 2 is where metering, quota, revocation and model-swap are shown (§6.3). If the direct MaaS lane is already locked down, those checks fail and the story collapses into "everything is blocked", which proves nothing about governance.
+**Do not close bypass B before the governance demo.** State 2 is where metering, quota, revocation and model-swap are shown (§7.3). If the direct MaaS lane is already locked down, those checks fail and the story collapses into "everything is blocked", which proves nothing about governance.
 
 **Demo order:**
 
 1. **State 1** — show the analyst's current workflow: a Bedrock URL and an AWS key. Optionally run it live from a notebook. This is the "before".
-2. **State 2** — §6.2 and §6.3. Same models, same SDK, now with attribution, quota, revocation and model swap. The AWS key would be revoked at this point in a real migration; you do not need to actually revoke it for a demo.
-3. **State 3** — §6.4. Guardrails, then the bypass attempt returning 403.
+2. **State 2** — §7.2 and §7.3. Same models, same SDK, now with attribution, quota, revocation and model swap. The AWS key would be revoked at this point in a real migration; you do not need to actually revoke it for a demo.
+3. **State 3** — §7.4. Guardrails, then the bypass attempt returning 403.
 
 Closing B is what turns "we added a filter" into "the filter cannot be avoided", so it is worth doing — but only after state 2 has been demonstrated.
 
@@ -2729,7 +2730,7 @@ curl -sk -o /dev/null -w "guardrailed:  %{http_code}\n" "${GR_ROUTE}/v1/chat/com
 # expect 200
 ```
 
-> **📝 Not executed on the reference cluster.** The rest of Part 5 is verified; this section is not. It will break §6.3's direct-lane checks once applied, so apply it **after** rehearsing state 2, or keep a second unrestricted subscription for those checks.
+> **📝 Not executed on the reference cluster.** The rest of Part 5 is verified; this section is not. It will break §7.3's direct-lane checks once applied, so apply it **after** rehearsing state 2, or keep a second unrestricted subscription for those checks.
 
 ## 5.7 Topology B — IPP plugins (investigation, not a procedure)
 
@@ -2770,18 +2771,327 @@ If NeMo does not fit, `guardrailsorchestrators.trustyai.opendatahub.io` provides
 
 Trade-off: detector thresholds rather than conversational logic, and it needs no LLM for the checks themselves. Consult the 3.5 guardrails guide; this runbook does not document it.
 
-# PART 6 — The demo
+# PART 6 — Observability
+
+> ## ✅ Verified — token metering working; dashboard and tracing not attempted
+>
+> §6.1–6.3 were run on the reference cluster. §6.4–6.6 are documented options that were **not** built.
+
+## 6.0 What you get, and what it costs
+
+Six layers, increasing in effort. Only the first three were built.
+
+| # | Layer | Answers | Needs | Status |
+|---|---|---|---|---|
+| 1 | Platform health | Is it serving? | A script | ✅ §6.1 |
+| 2 | Per-request usage | What did this call cost? | Nothing — already in every response | ✅ §6.2 |
+| 3 | **Aggregated metering** | **Tokens per model over time** | Tenant telemetry + UWM | ✅ §6.3 |
+| 4 | RHOAI Observability dashboard | Per-user / per-department charts | Cluster Observability Operator + DSCI metrics storage | 📝 §6.4 |
+| 5 | Request tracing | Where did the latency go? | OTel collector + Kuadrant tracing | 📝 §6.5 |
+| 6 | Audit trail | Who called what, when | Unresolved — see §6.6 | ⚠️ §6.6 |
+
+**Do layer 3.** It is two commands and it is what makes the chargeback story real rather than aspirational.
+
+## 6.1 Platform health
+
+The two failures observed on this cluster — HTTPRoute drift and a stale gateway replica — are both invisible until someone makes a request. See Appendix H.2 for the combined health check; schedule it rather than running it by hand.
+
+```bash
+oc get gateway -A                                          # both PROGRAMMED
+oc get aitenant,maastenantconfig -A                        # READY True
+oc get pods -n redhat-ai-gateway-infra                     # maas-api 1/1
+oc get maasmodelref -n ${MODEL_NS}                         # PHASE Ready
+curl -sk "${MAAS_GW}/maas-api/health"; echo                # healthy
+```
+
+## 6.2 Per-request usage — free, already working
+
+Every response carries its own cost. Nothing to configure.
+
+```bash
+curl -sk -m 60 "${MAAS_GW}/v1/chat/completions" -H "Authorization: Bearer ${API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mistral-large","messages":[{"role":"user","content":"Say hello in 3 words."}],"max_tokens":300}' \
+  | jq '{model, usage}'
+```
+
+```json
+{"model": "mistral.mistral-large-3-675b-instruct",
+ "usage": {"prompt_tokens": 68, "completion_tokens": 45, "total_tokens": 113}}
+```
+
+Note `model` is the **targetModel**, proving the gateway substituted it. The calling application sees its own consumption immediately — useful for client-side budgeting, but the platform does not aggregate this. That is §6.3.
+
+## 6.3 Aggregated metering — the chargeback layer
+
+### Enable telemetry on the tenant
+
+**This is the step that creates the Limitador PodMonitor.** Without it, Limitador counts tokens and nothing collects them.
+
+```bash
+oc explain maastenantconfig.spec.telemetry --recursive
+
+oc patch maastenantconfig default-tenant -n models-as-a-service --type=merge -p '{
+  "spec": {"telemetry": {"enabled": true, "metrics": {
+    "captureUser": true, "captureGroup": true,
+    "captureOrganization": true, "captureModelUsage": true }}}}'
+
+sleep 60
+oc get podmonitor -n kuadrant-system
+# kuadrant-limitador-monitor   ← created by the patch above
+```
+
+User Workload Monitoring (§2.4) must already be enabled.
+
+### The metric names — nothing is called "token"
+
+> **This is why metering looks broken when it isn't.** Searching Prometheus for metric names containing `token` returns nothing. Limitador uses different names:
+
+| Metric | Meaning |
+|---|---|
+| `authorized_hits` | **Tokens consumed**, by `limitador_namespace` |
+| `authorized_calls` | **Requests** allowed |
+| `limited_calls` | Requests rejected for exceeding quota |
+| `limitador_up` | Liveness |
+
+`limitador_namespace` is `<model-namespace>/<model-name>`, e.g. `external-models/mistral-large`.
+
+Read the exporter directly if in doubt — faster than guessing at names:
+
+```bash
+oc exec -n kuadrant-system deployment/limitador-limitador -- \
+  curl -s http://localhost:8080/metrics | grep -E '^(authorized|limited)' 
+```
+
+### Verify
+
+```bash
+oc -n openshift-user-workload-monitoring exec prometheus-user-workload-0 -c prometheus -- \
+  wget -qO- 'http://localhost:9090/api/v1/targets?state=active' \
+  | python3 -c "import sys,json;[print(t['labels'].get('job'),t['health'],t.get('lastError','')) for t in json.load(sys.stdin)['data']['activeTargets'] if 'limitador' in str(t['labels']).lower()]"
+# kuadrant-system/kuadrant-limitador-monitor up
+
+oc -n openshift-user-workload-monitoring exec prometheus-user-workload-0 -c prometheus -- \
+  wget -qO- 'http://localhost:9090/api/v1/query?query=authorized_hits' | python3 -m json.tool
+```
+
+Verified result on the reference cluster:
+
+```
+external-models/bedrock-gpt-oss-20b   2101 tokens
+external-models/mistral-large         3552 tokens
+```
+
+### Queries
+
+```promql
+sum by (limitador_namespace) (authorized_hits)      # tokens per model
+sum by (limitador_namespace) (authorized_calls)     # requests per model
+rate(authorized_hits[5m])                           # token burn rate
+sum by (limitador_namespace) (limited_calls)        # quota rejections
+authorized_hits / authorized_calls                  # avg tokens per request
+```
+
+That last one is the cost-comparison metric — it is what shows a reasoning model costing an order of magnitude more per request than a direct one.
+
+**On screen:** OpenShift console → **Observe → Metrics**, paste the first query. Live consumption per model from real traffic.
+
+### What this layer does NOT give you
+
+| Gap | Detail |
+|---|---|
+| Per-**user** attribution | `captureUser`/`captureGroup` are set, but the observed label set is only `limitador_namespace`. **Not confirmed** — likely needs §6.4 |
+| Consumer-visible quota | No `X-RateLimit-*` headers in 3.5 GA. An analyst cannot see their own remaining budget |
+| A verified `429` | Enforcement at the limit was never triggered |
+| `maas-api` metrics | Its PodMonitor scrapes port name `metrics`; the container exposes only `8443/https`, so it is never scraped. Only `/health` latency — nothing lost |
+| `maas-controller` metrics | Target reports `down` — `context deadline exceeded` on `:8080` |
+
+## 6.4 RHOAI Observability dashboard — ⚠️ built, blocked by a namespace bug
+
+The per-user and per-department dashboards exist and their queries **do** group by user. Getting them to render requires two operators, and **the namespace you install one of them into decides whether it works at all.**
+
+### Prerequisites — the namespace matters
+
+```bash
+oc get packagemanifests.packages.operators.coreos.com -n openshift-marketplace \
+  -o custom-columns='NAME:.metadata.name,SOURCE:.status.catalogSource' 2>/dev/null \
+  | grep -iE 'observability|opentelemetry'
+# cluster-observability-operator   redhat-operators
+# opentelemetry-product            redhat-operators
+```
+
+> ## ⚠ Install COO into `openshift-cluster-observability-operator`, NOT `openshift-operators`
+>
+> RHOAI creates a NetworkPolicy `perses-operator-access` in `redhat-ods-monitoring` that permits ingress **only** from namespace `openshift-cluster-observability-operator`:
+>
+> ```yaml
+> ingress:
+>   - from:
+>       - namespaceSelector:
+>           matchLabels:
+>             kubernetes.io/metadata.name: openshift-cluster-observability-operator
+>         podSelector:
+>           matchLabels:
+>             app.kubernetes.io/name: perses-operator
+> ```
+>
+> Install COO into `openshift-operators` — the default that catalog offers — and the Perses operator is **network-blocked from its own Perses server**. Every dashboard fails to load, with the only evidence buried in a CR status:
+>
+> ```
+> PersesBackendError: Get "http://data-science-perses...:8080/api/v1/projects/redhat-ods-monitoring":
+> context deadline exceeded
+> ```
+>
+> The RHOAI console shows only *"No dashboards were found. Verify that the monitoring stack is configured correctly."* — accurate but unhelpful.
+
+Correct install:
+
+```bash
+oc create namespace openshift-cluster-observability-operator
+
+cat <<'EOF' | oc apply -f -
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: coo-og
+  namespace: openshift-cluster-observability-operator
+spec: {}
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: cluster-observability-operator
+  namespace: openshift-cluster-observability-operator
+spec:
+  channel: stable
+  name: cluster-observability-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: opentelemetry-product
+  namespace: openshift-operators
+spec:
+  channel: stable
+  name: opentelemetry-product
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+EOF
+```
+
+The OpenTelemetry operator has no equivalent policy constraint, so `openshift-operators` is fine for it.
+
+### Configure metrics storage on the DSCI
+
+```bash
+oc explain dscinitialization.spec.monitoring --recursive
+
+oc patch dscinitialization default-dsci --type=merge -p '{
+  "spec": {"monitoring": {"metrics": {"replicas": 1, "storage": {"retention": "1d"}}}}}'
+```
+
+Without both operators the DSCI loops with a precise error, which is the fastest way to confirm what is missing:
+
+```
+Monitoring preconditions failed: 2 errors occurred:
+  * OpenTelemetryCollector operator must be installed for OpenTelemetry configuration
+  * ClusterObservability operator must be installed for metrics configuration
+```
+
+### Verify
+
+```bash
+oc get dsci default-dsci -o jsonpath='{.status.conditions}' | python3 -m json.tool | grep -B2 -A4 MonitoringStack
+# MonitoringStackAvailable: True
+
+oc get pods -n redhat-ods-monitoring
+oc get persesdashboard -n redhat-ods-monitoring
+oc get persesdashboard dashboard-3-maas-usage-admin -n redhat-ods-monitoring \
+  -o jsonpath='{.status.conditions[0].reason}'; echo      # must NOT be PersesBackendError
+```
+
+A healthy stack brings up Prometheus, Thanos Querier, Alertmanager (2), an OTel collector with target allocator, Perses, and the usage-logs collector.
+
+### The three MaaS dashboards
+
+```
+dashboard-3-maas-usage-admin       admin view of usage
+dashboard-4-maas-usage-logs-admin  admin view of usage logs   ← needs Loki, see §6.6
+dashboard-5-maas-usage-logs        per-user view of usage logs ← needs Loki
+```
+
+**Per-user attribution exists.** The usage dashboard's queries group by `user`, `subscription` and `model`:
+
+```promql
+round(sum by (user, subscription, model) (increase(authorized_hits_total{user!=""}[...])))
+count(count by (user) (sum by (user, subscription, limitador_namespace) (...)))
+```
+
+Note `{user!=""}` — series without a user label are excluded. **Traffic authenticated with an admin token has no `user` label and will not appear.** Test with keys minted for real users before concluding attribution is broken.
+
+> **Note the metric names differ by collection path.** Through COO's OTel collector they gain a `_total` suffix: `authorized_hits_total`, `authorized_calls_total`, `limited_calls_total`. Queried directly from UWM (§6.3) they are `authorized_hits`, `authorized_calls`. Using the wrong one returns an empty result set that looks like missing data.
+
+The COO path also adds useful labels the UWM path lacks — `cloud_region`, `k8s_cluster_name`, `k8s_namespace_name` — which allow aggregation across clusters.
+
+> **Not in the OpenShift console.** *Observe → Dashboards* there lists the Kubernetes/etcd mixins and four **vLLM serving** dashboards (`vllm:*`, `llm_isvc_name`, `inference_pool_*`). With no vLLM and no LLMInferenceServices they show "No datapoints found" — correct, but not about external models. The MaaS dashboards render in the **RHOAI** console under **Observe & monitor → Dashboard**.
+
+## 6.5 Request tracing — 📝 not attempted
+
+`Kuadrant.spec.observability.tracing.defaultEndpoint` accepts an OTel collector endpoint, giving spans across Authorino → Limitador → IPP → AWS.
+
+Worth it for one reason from this build: the stale-replica problem took an hour to find by correlating pod IPs in Envoy access logs. A trace would have shown it immediately. If the customer already runs OTel, this is cheap.
+
+```bash
+oc explain kuadrant.spec.observability.tracing --recursive
+```
+
+## 6.6 Audit trail — ⚠️ designed but not shippable: Loki missing
+
+The per-request audit trail **is** a designed feature. Every piece is present except the backend.
+
+| Component | State |
+|---|---|
+| `usage-logs-collector` (OTLP :4317) | ✅ Running in `redhat-ods-monitoring` |
+| `usage-logs-tenancy-proxy` | ✅ Running — enforces per-user filtering |
+| `usage-logs-all`, `usage-logs-multi-tenancy` PersesDatasources | ✅ Present, `kind: LokiDatasource` |
+| `dashboard-4-maas-usage-logs-admin`, `dashboard-5-maas-usage-logs` | ✅ Present, `LokiTimeSeriesQuery` |
+| **Loki itself** | ❌ **Not installed, and no DSCI field configures it** |
+
+`dashboard-5-maas-usage-logs` describes exactly what a compliance team would want:
+
+> *"Personal view of model usage. Shows your token consumption, request counts, and rate limiting. Queries are automatically filtered to your user identity via the Loki query proxy."*
+
+`Config.spec.usageLogging` on `config.maas.opendatahub.io/default` is presumably the producer switch. Setting it `true` and restarting `maas-api` produced no visible logging — expected, since **inference never touches `maas-api`** (client → Envoy → IPP → AWS). The records go via the OTLP collector, which has nowhere to send them.
+
+```bash
+oc get pods -A | grep -i loki                    # nothing
+oc explain dscinitialization.spec.monitoring --recursive | grep -i 'logs\|loki'   # nothing
+oc get packagemanifests.packages.operators.coreos.com -n openshift-marketplace 2>/dev/null | grep -i loki
+# loki-operator (redhat-operators), loki-operator / loki-helm-operator (community)
+```
+
+**Not attempted.** `loki-operator` is available from `redhat-operators`, but with no DSCI field to point RHOAI at a LokiStack, how the collector is meant to be wired is unclear.
+
+**For a customer with a regulatory requirement, treat the audit trail as an open question.** What exists today is the Envoy access log (path, status, model route, timing) and the IPP log (resolved model and provider) — neither joins a user identity to a request, so neither is compliance-grade. For an Israeli customer sending prompts to a US region this may be a gate rather than a nice-to-have.
+
+---
+
+# PART 7 — The demo
 
 > ## ⚠️ Partly verified
 >
-> **All three demos have been run**, including guardrails (§6.4) now that Part 5 is built.
-> **One exception: metering.** Telemetry was never configured, so the observability dashboard has no data. §6.3 says what to show instead. Do not open that dashboard in front of a customer.
+> **All three demos have been run**, including guardrails (§7.4) now that Part 5 is built.
+> **One exception: metering.** Telemetry was never configured, so the observability dashboard has no data. §7.3 says what to show instead. Do not open that dashboard in front of a customer.
 
 Written against the **verified working state**. Every command here was run successfully on the reference cluster. Where something is not yet working, it says so.
 
 ---
 
-## 6.0 Pre-flight — 10 minutes before
+## 7.0 Pre-flight — 10 minutes before
 
 Do not skip. Two of these have bitten during this build.
 
@@ -2791,7 +3101,7 @@ export CLUSTER_DOMAIN=$(oc get ingresses.config.openshift.io cluster -o jsonpath
 export MAAS_GW="https://maas.${CLUSTER_DOMAIN}"
 export MODEL_NS="external-models"
 export MODEL="bedrock-gpt-oss-20b"
-export MODEL2="mistral-large"        # cross-vendor swap for §6.2
+export MODEL2="mistral-large"        # cross-vendor swap for §7.2
 echo "$MAAS_GW"
 
 # 2. Health
@@ -2827,10 +3137,18 @@ done
 >
 > | What | How it shows | Fix |
 > |---|---|---|
-> | **HTTPRoute patch reverts** (Appendix G §2, §10) | Every call `404` | Re-apply the §4.5b patch |
+> | **HTTPRoute patch reverts** (Appendix G §2, §10) | Every call `404` | Re-apply the §4.5b patch. **Triggered by time AND by any DSCI/DSC change** |
+> | **Your `oc` session expires** | `oc` commands return `Unauthorized`; `$(oc whoami -t)` yields an empty header, which looks like an auth bug | `oc login` again, then re-mint the API key |
 > | **A gateway replica goes stale** (Appendix G §6) | ~10–50% of calls `503` | Restart the gateway deployment |
 >
 > Both were observed **overnight, with nobody touching the cluster.** Steps 3 and 6 above are therefore not optional, and "it worked at rehearsal" is not evidence it works now. **Run this pre-flight immediately before presenting, not an hour before.**
+
+```bash
+# 7. Metrics are being collected (Part 6) — the §7.3 metering beat depends on this
+oc -n openshift-user-workload-monitoring exec prometheus-user-workload-0 -c prometheus -- \
+  wget -qO- 'http://localhost:9090/api/v1/query?query=authorized_hits' \
+  | python3 -c "import sys,json;print(len(json.load(sys.stdin)['data']['result']),'series')"
+```
 
 Any 503 → restart the gateway and repeat step 6:
 
@@ -2845,7 +3163,7 @@ Also open ahead of time: the RHOAI dashboard (logged in), the `bedrock-demo` wor
 
 ---
 
-## 6.1 The setup — 2 minutes, no terminal
+## 7.1 The setup — 2 minutes, no terminal
 
 Say this before touching anything.
 
@@ -2867,7 +3185,7 @@ analyst → RHOAI gateway → AWS Bedrock
 
 ---
 
-## 6.2 Demo 1 — The analyst experience (Workbench)
+## 7.2 Demo 1 — The analyst experience (Workbench)
 
 Open the workbench in `bedrock-demo`. New notebook.
 
@@ -2920,7 +3238,7 @@ Registering more models: §4.5d.
 
 ---
 
-## 6.3 Demo 2 — Governed access (terminal)
+## 7.3 Demo 2 — Governed access (terminal)
 
 Four commands. Run them, don't narrate the syntax.
 
@@ -2970,6 +3288,114 @@ Mint a new one and carry on.
 
 ### Metering
 
+**Console: Observe → Metrics**, paste:
+
+```promql
+sum by (limitador_namespace) (authorized_hits)
+```
+
+Live token consumption per model, from real traffic. Reference cluster: 2101 for `bedrock-gpt-oss-20b`, 3552 for `mistral-large`.
+
+> "That is your chargeback input — actual consumption per model. Subscriptions carry a cost centre and organisation ID, so the same data slices by department."
+
+Also show **Settings → MaaS governance** for the subscriptions, limits, priorities and cost-centre metadata.
+
+**Prerequisites and the full picture are in Part 6.** Two things to remember here:
+
+- **Telemetry must be enabled on the tenant** (§6.3) or there is nothing to query — the patch is what creates the Limitador PodMonitor.
+- **Do not open the RHOAI Observability dashboard** (§6.4) — it needs the Cluster Observability Operator, which is not installed. It will be empty.
+
+> **Not available:** no `X-RateLimit-*` headers, so a consumer cannot see their own remaining quota; a live `429` was never verified; per-user attribution is unconfirmed (§6.3). Show per-model consumption and the subscription definitions instead.
+
+### Revocation — the strongest beat
+
+**Console:** **Gen AI studio → API keys**. Show the list, revoke the demo key, then re-run the notebook cell. It fails.
+
+> "That analyst is offboarded. No AWS credential rotated, nobody else disrupted, no ticket to a cloud team. Compare that with today, where revoking one analyst means rotating a key that everyone shares."
+
+Mint a new one and carry on.
+
+### Metering — working, once telemetry is enabled
+
+Token metering **is** available, but two things must be true and neither is on by default.
+
+**1. Enable telemetry on the tenant.** This is what creates the Limitador PodMonitor:
+
+```bash
+oc patch maastenantconfig default-tenant -n models-as-a-service --type=merge -p '{
+  "spec": {"telemetry": {"enabled": true, "metrics": {
+    "captureUser": true, "captureGroup": true,
+    "captureOrganization": true, "captureModelUsage": true }}}}'
+
+sleep 60
+oc get podmonitor -n kuadrant-system      # kuadrant-limitador-monitor should appear
+```
+
+**2. Know the metric names.** Limitador does not use the word "token" anywhere:
+
+| Metric | Meaning |
+|---|---|
+| `authorized_calls` | **Requests** allowed, by `limitador_namespace` |
+| `authorized_hits` | **Tokens** consumed, by `limitador_namespace` |
+| `limited_calls` | Requests rejected for exceeding quota |
+| `limitador_up` | Liveness |
+
+> Searching Prometheus for metric names containing `token` returns nothing, which reads as "metering is not working". It is — under a different name. `limitador_namespace` is `<model-namespace>/<model-name>`.
+
+**Verify:**
+
+```bash
+oc -n openshift-user-workload-monitoring exec prometheus-user-workload-0 -c prometheus -- \
+  wget -qO- 'http://localhost:9090/api/v1/targets?state=active' \
+  | python3 -c "import sys,json;[print(t['labels'].get('job'),t['health']) for t in json.load(sys.stdin)['data']['activeTargets'] if 'limitador' in str(t['labels']).lower()]"
+# kuadrant-system/kuadrant-limitador-monitor up
+
+oc -n openshift-user-workload-monitoring exec prometheus-user-workload-0 -c prometheus -- \
+  wget -qO- 'http://localhost:9090/api/v1/query?query=authorized_hits' | python3 -m json.tool
+```
+
+Verified output:
+
+```
+external-models/bedrock-gpt-oss-20b   2101
+external-models/mistral-large         3552
+```
+
+**Queries for the demo:**
+
+```promql
+sum by (limitador_namespace) (authorized_hits)              # tokens per model
+sum by (limitador_namespace) (authorized_calls)             # requests per model
+rate(authorized_hits[5m])                                   # token burn rate
+sum by (limitador_namespace) (limited_calls)                # quota rejections
+```
+
+**On screen:** OpenShift console → **Observe → Metrics**, paste `sum by (limitador_namespace) (authorized_hits)`. That is real consumption from real traffic, per model, live.
+
+> "That is your chargeback input — actual token consumption per model, from live traffic. Subscriptions carry a cost centre and organisation ID, so the same data slices by department."
+
+### What is NOT available
+
+| | |
+|---|---|
+| Per-**user** token breakdown | The `capture*` flags are set, but the observed label set is only `limitador_namespace`. Per-user attribution was **not** confirmed |
+| The RHOAI **Observability dashboard** | Needs the Cluster Observability Operator and metrics storage in the `DSCInitialization` (docs §1.8) — **not installed**. Use the OpenShift console's metrics view instead |
+| `X-RateLimit-*` response headers | Absent in 3.5 GA (Appendix G §5) — a consumer cannot see their own remaining quota |
+| A live `429` | Never triggered; do not script it |
+| `maas-api` metrics | The PodMonitor scrapes port name `metrics`; the container exposes only `8443/https`, so it is never scraped. Only `/health` latency anyway — nothing lost |
+
+Do not open the RHOAI Observability dashboard in a demo. **Do** open **Observe → Metrics** with the query above.
+
+### Revocation — the strongest beat
+
+**Console:** **Gen AI studio → API keys**. Show the list, revoke the demo key, then re-run the notebook cell. It fails.
+
+> "That analyst is offboarded. No AWS credential rotated, nobody else disrupted, no ticket to a cloud team. Compare that with today, where revoking one analyst means rotating a key that everyone shares."
+
+Mint a new one and carry on.
+
+### Metering
+
 > ## ⚠ The observability dashboard has NO DATA on the reference cluster
 >
 > Telemetry was never configured. `MaasTenantConfig.spec.telemetry` is unset, the Cluster Observability Operator is not installed, and the only MaaS-related metric present in Prometheus is `limitador_up` — **no token metrics at all**.
@@ -3004,9 +3430,9 @@ That framing is accurate and does not overclaim. Saying "here's the chargeback d
 
 ---
 
-## 6.4 Demo 3 — Guardrails
+## 7.4 Demo 3 — Guardrails
 
-> **Sequencing:** §6.2–6.3 demonstrate *state 2* (governed access, direct MaaS lane open). This section moves to *state 3* (guardrails mandatory). Do not close bypass B (§5.6) before rehearsing §6.3 — the direct-lane checks there depend on that lane still working. See §5.6 for the three-state model.
+> **Sequencing:** §7.2–6.3 demonstrate *state 2* (governed access, direct MaaS lane open). This section moves to *state 3* (guardrails mandatory). Do not close bypass B (§5.6) before rehearsing §7.3 — the direct-lane checks there depend on that lane still working. See §5.6 for the three-state model.
 
 **Not yet built.** Part 5 covers the design; it was not implemented on the reference cluster. Describe it, don't demo it:
 
@@ -3016,7 +3442,7 @@ If you have implemented Part 5, run §5.4 and §5.5's tests instead and finish w
 
 ---
 
-## 6.5 Closing — the summary slide
+## 7.5 Closing — the summary slide
 
 | Today | With RHOAI |
 |---|---|
@@ -3030,7 +3456,7 @@ If you have implemented Part 5, run §5.4 and §5.5's tests instead and finish w
 
 ---
 
-## 6.6 Be upfront about these
+## 7.6 Be upfront about these
 
 Say them before you're asked. It costs nothing and buys credibility.
 
@@ -3044,7 +3470,7 @@ Say them before you're asked. It costs nothing and buys credibility.
 
 ---
 
-## 6.7 If something fails live
+## 7.7 If something fails live
 
 | Symptom | Say | Do |
 |---|---|---|
@@ -3056,7 +3482,7 @@ Say them before you're asked. It costs nothing and buys credibility.
 
 **If it fails hard:** switch to the architecture and the summary table. The story is governance, and the governance layer is provable without a completion — 403 on a forged key and `model_not_in_subscription` both work without touching AWS.
 
-# PART 7 — Troubleshooting
+# PART 8 — Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -3115,7 +3541,7 @@ oc describe datasciencecluster default-dsc
 
 ---
 
-# PART 8 — Cleanup
+# PART 9 — Cleanup
 
 > 📝 **Untested.** Written for completeness; not exercised. Check what a delete cascades to before running it on anything you care about.
 
@@ -3180,7 +3606,7 @@ aws iam delete-service-specific-credential \
 [ ] §2.5 redhat-ods-applications labelled maas.opendatahub.io/gateway-access=true
 [ ] §2.6 PostgreSQL running; maas-db-config in the INFRA namespace (redhat-ai-gateway-infra)
 [ ] §2.7 DSC applied and Ready; dashboard reachable (both classic Route and $MAAS_GW)
-[ ] §2.7 Workbench smoke test passed — notebook runs AND has egress (reused in §6.2)
+[ ] §2.7 Workbench smoke test passed — notebook runs AND has egress (reused in §7.2)
 [ ] §2.8 aigateway + modelsAsAService Managed  (spelling: AsA)
 [ ] §2.8 Both fields confirmed present in spec.components.aigateway
 [ ] §2.8 AIGateway/AITenant/MaasTenantConfig all READY True
@@ -3224,16 +3650,17 @@ aws iam delete-service-specific-credential \
 [ ] Blocked prompt did NOT reach AWS (payload-processing log count unchanged)
 [ ] Bypass closed — direct MaaS URL returns 403 for analyst key
 
---- Part 6: demo ---
+--- Part 7: demo ---
 [ ] Workbench created, notebook calls MaaS via OpenAI SDK
 [ ] Model swap in the notebook works unchanged
 [ ] 403 bogus / 401 no-auth / ratelimit headers
 [ ] Live 429 on the trial subscription
 [ ] Key revocation without AWS rotation
-[ ] Header stripping verified functionally (§6.5) — REQUIRED, version is unreadable
+[ ] Header stripping verified functionally (§7.5) — REQUIRED, version is unreadable
 [ ] Guardrails: clean prompt passes, PII blocked, jailbreak blocked
 [ ] Guardrails: blocked prompt produced ZERO AWS calls (counter unchanged)
-[ ] Token counts shown from usage.total_tokens per response (NOT the dashboard — no data)
+[ ] Telemetry enabled on the tenant; kuadrant-limitador-monitor target is up
+[ ] Observe → Metrics: sum by (limitador_namespace) (authorized_hits) returns data
 ```
 
 ---
@@ -3508,7 +3935,7 @@ Do this **before** Part 4 — changing identity afterwards invalidates issued AP
 [ ] Groups agreed for MaaSAuthPolicy and per-department MaaSSubscription
 [ ] Air-gapped? Image mirroring plan covers RHOAI, RHCL, and guardrails detectors
 [ ] Gateway/Limitador HA decided — the gateway is now on the analyst critical path
-[ ] Kuadrant `spec.mtls` decision made with the security team (off during bring-up, enable after Part 6 passes)
+[ ] Kuadrant `spec.mtls` decision made with the security team (off during bring-up, enable after Part 7 passes)
 [ ] ABSK key rotation runbook written and owned (two keys per IAM user enables zero-downtime)
 ```
 
@@ -3699,13 +4126,25 @@ Other limitations from the same section worth carrying: cross-format translation
 
 Option 2 is the quicker route to a working Claude model, at the cost of a separate vendor contract. Note it also loses token rate limiting (finding 2c).
 
-## 5. No rate-limit headers, and no token metrics without extra setup
+## 5. Metering works, but nothing is named "token" — ✅ resolved
 
-HTTPRoute status shows `kuadrant.io/TokenRateLimitPolicyAffected: True` and `MaaSSubscription` is Active, but responses carry no `X-RateLimit-*` headers. Enforcement at the limit was never triggered, so a live `429` is unverified.
+**Initially misdiagnosed as "no metering".** Searching Prometheus for metric names containing `token` returns nothing, which looks conclusive. Limitador names them `authorized_hits` (tokens) and `authorized_calls` (requests), keyed by `limitador_namespace`.
 
-**And the fallback is not available either.** With telemetry unconfigured, Prometheus holds only `limitador_up` — no token metrics — so the observability dashboard is empty. Between them, this leaves **no way to show quota state to a consumer**: not in response headers, not in a dashboard. Only `usage.total_tokens` per response, which the client sees but the platform does not aggregate.
+Two prerequisites, neither on by default:
 
-Enabling metering requires the Cluster Observability Operator, metrics storage in the `DSCInitialization`, and `MaasTenantConfig.spec.telemetry` with the `capture*` flags (docs §1.8). Not attempted on the reference cluster.
+1. `MaasTenantConfig.spec.telemetry.enabled: true` plus the `capture*` flags — **this is what creates the `kuadrant-limitador-monitor` PodMonitor**. Without it nothing is scraped.
+2. User Workload Monitoring (§2.4).
+
+Verified working: `authorized_hits` returned 2101 for `external-models/bedrock-gpt-oss-20b` and 3552 for `external-models/mistral-large`.
+
+**Genuine gaps that remain:**
+
+- **No `X-RateLimit-*` response headers**, so a consumer cannot see their own remaining quota. A live `429` was never triggered.
+- **Per-user attribution unconfirmed.** The `captureUser` / `captureGroup` flags are set, but the observed label set is only `limitador_namespace`. Per-department chargeback may need the RHOAI Observability dashboard, which needs the Cluster Observability Operator (not installed).
+- **`maas-api` is never scraped.** Its PodMonitor selects port name `metrics`; the container exposes only `8443/https`. A packaging bug, though the metrics are only `/health` latency.
+- **`maas-controller` metrics target is `down`** — `context deadline exceeded` on `:8080`.
+
+**Lesson:** a metric-name search is not proof of absence. Read the exporter's `/metrics` endpoint directly before concluding a feature does not work.
 
 ## 6. Gateway replicas go stale — two symptoms, and it recurs over time
 
@@ -3716,7 +4155,13 @@ One of the two gateway replicas can end up serving stale configuration. **The sy
 | LoadBalancer (ELB) | `503` after a full ~60s hang, ~50% of calls | Envoy access log, flags `UC,DC downstream_remote_disconnect` |
 | **ClusterIP + Route** | **`503` in <1s, ~10% of calls** | **Nowhere in the Envoy log** — the OpenShift router fails fast against a pod not accepting connections, so the request never reaches the gateway |
 
-**It is not only triggered by a config change.** On the reference cluster both pods ran healthy for an evening, then degraded overnight with no operator action — 25h uptime, having earlier been through a listener hostname change and the ClusterIP switch.
+**It is not only triggered by a config change.** Observed three times on the reference cluster:
+
+1. After the ClusterIP/Service-type switch — ~50% failures
+2. Overnight with no operator action, at 25h pod uptime — ~10% failures
+3. After installing the observability operators — 2 in 6 failures
+
+Treat a gateway restart as a standing step after **any** platform change, and always follow with the six-call loop.
 
 Diagnosis:
 
@@ -3805,7 +4250,23 @@ oc get httproute mistral-large -n external-models \
 # mistral.mistral-large-3-675b-instruct   ← reverted
 ```
 
-**Consequence: a working demo silently breaks with no action from the operator.** Re-apply and re-verify immediately before any demo, not an hour before. This makes finding 2 a blocker for any unattended use, not just an inconvenience.
+**Observed three times.** Two triggers identified:
+
+| Trigger | Observed |
+|---|---|
+| **Time / periodic reconcile** | Held for 1h; reverted within 24h with no operator action |
+| **Any DSCI change** | Reverted within ~60s of patching `dscinitialization.spec.monitoring` — an entirely unrelated change |
+| **Operator installs** | Observed again after installing the Cluster Observability and OpenTelemetry operators |
+
+The second is the more dangerous, because it makes the failure *causally invisible*: you change a monitoring setting and inference breaks, with nothing linking the two.
+
+**Operational rule:** re-apply and re-verify the patch
+
+- immediately before any demo — not an hour before;
+- **after any change to the DSCI, DSC, or any component CR**;
+- after any operator install or upgrade.
+
+This makes finding 2 a blocker for unattended use, not an inconvenience.
 
 ## 11. Diagnostic anti-patterns from this build
 
@@ -3815,6 +4276,53 @@ Recorded because each cost real time:
 - **`Internal server error` in a NeMo response body is never the real error.** The cause is only in the pod log.
 - **One data point is not a confirmation.** An HTTP/1.1 request 404'd and HTTP/2 was assumed to work, producing a "protocol requirement" theory that the control test immediately disproved — the real cause was the reverted HTTPRoute. Run the control before naming a cause.
 - **Check the cheap explanation first.** Expired credential, reverted patch, unset variable — before SCPs, protocol negotiation, or RBAC.
+
+## 12. Installing COO into `openshift-operators` silently breaks every dashboard — ✅ verified
+
+RHOAI creates NetworkPolicy `perses-operator-access` in `redhat-ods-monitoring` permitting ingress **only** from namespace `openshift-cluster-observability-operator`. The Cluster Observability Operator's catalog entry defaults to `openshift-operators`, which is also where the other operators in this runbook go.
+
+Install it there and the Perses operator cannot reach the Perses server. Result: zero projects, zero dashboards loaded, and nine `PersesDashboard` CRs stuck in:
+
+```
+PersesBackendError: Get "http://data-science-perses.redhat-ods-monitoring.svc.cluster.local:8080
+  /api/v1/projects/redhat-ods-monitoring": context deadline exceeded
+```
+
+The RHOAI console reports only *"No dashboards were found. Verify that the monitoring stack is configured correctly."*
+
+Confirmed with a cross-namespace probe returning `000` (blocked, not refused):
+
+```bash
+oc run nettest --rm -it --restart=Never -n openshift-operators \
+  --image=registry.access.redhat.com/ubi9/ubi-minimal:latest --command -- \
+  curl -s -m 10 -o /dev/null -w "%{http_code}\n" \
+  http://data-science-perses.redhat-ods-monitoring.svc.cluster.local:8080/api/v1/projects
+```
+
+**Fix:** install COO into `openshift-cluster-observability-operator` with its own OperatorGroup (§6.4). A hand-written NetworkPolicy also works but leaves a non-standard resource behind.
+
+**Severity: high.** The default install path produces a silently broken feature, and the only diagnostic is a status condition on a CR nobody would think to inspect.
+
+## 13. Loki datasources and dashboards ship, Loki does not — ✅ verified
+
+The usage-logs audit path is fully wired except for its backend: an OTLP collector, a tenancy proxy, two `LokiDatasource` PersesDatasources, and two Loki-backed dashboards — with **no Loki installed and no DSCI field to configure one**.
+
+`dashboard-5-maas-usage-logs` promises *"Personal view of model usage... filtered to your user identity via the Loki query proxy."* It will render empty.
+
+`loki-operator` is available from `redhat-operators`, but how RHOAI expects it to be wired is undocumented. **Not attempted.** See §6.6 — this is the audit-trail gap, and it may be a compliance gate for some customers.
+
+## 14. Metric names differ by collection path — ✅ verified
+
+| Path | Metric names |
+|---|---|
+| UWM, scraping Limitador directly | `authorized_hits`, `authorized_calls`, `limited_calls` |
+| COO's OTel collector | `authorized_hits_total`, `authorized_calls_total`, `limited_calls_total` |
+
+Query the wrong one and Prometheus returns an empty result set — indistinguishable from "the feature does not work". This cost real time twice: first searching for metric names containing `token` (Limitador uses neither), then querying `authorized_hits` against the COO Prometheus where only `authorized_hits_total` exists.
+
+The COO path adds `cloud_region`, `k8s_cluster_name` and `k8s_namespace_name`, enabling cross-cluster aggregation the UWM path cannot do.
+
+**Lesson, repeated:** an empty query result is not evidence of a missing feature. Read the exporter's `/metrics` endpoint, or list `__name__` values, before concluding anything.
 
 ## Diagnostic techniques worth reusing
 
@@ -3871,6 +4379,9 @@ Ordered by what would most improve the product:
 | 8 + 6 | Gateway listener/Service changes leave one replica stale; ~50% `503 UC,DC` until manually restarted | Medium | ✅ Verified |
 | 3 | `ExternalProvider` reports Ready without validating the credential | Low — a status condition would have saved hours | ✅ Verified |
 | 5 | No `X-RateLimit-*` headers on responses despite the policy attaching | Low | ✅ Verified |
+| 12 | COO installed into `openshift-operators` (the catalog default) is network-blocked from Perses by RHOAI's own NetworkPolicy — every dashboard silently empty | **High** — default install path produces a broken feature | ✅ Verified |
+| 13 | Loki datasources, collector, tenancy proxy and two dashboards ship; Loki itself does not, and no DSCI field configures it | Medium — the audit trail is unreachable | ✅ Verified |
+| 14 | Metric names differ between the UWM and COO collection paths (`authorized_hits` vs `authorized_hits_total`) | Low — but wasted hours twice | ✅ Verified |
 | 4 | Anthropic on Bedrock Mantle unresolved; likely needs `sigv4` | Low — OpenAI-family models work | ⚠️ Untested hypothesis |
 
 ---
@@ -3931,9 +4442,11 @@ aws iam create-service-specific-credential --user-name rhoai-maas-bedrock \
 
 | What | Observed | Detection | Fix |
 |---|---|---|---|
-| **HTTPRoute patch reverts** (Appendix G §2, §10) | Held 1h, reverted within 24h. Every request `404` | `oc get httproute <m> -n ${MODEL_NS} -o jsonpath='{.spec.rules[3].matches[0].headers[0].value}'` — must equal `modelName` | Re-apply the §4.5b patch |
+| **HTTPRoute patch reverts** (Appendix G §2, §10) | Held 1h, reverted within 24h. Also reverts within ~60s of **any DSCI change**. Every request `404` | `oc get httproute <m> -n ${MODEL_NS} -o jsonpath='{.spec.rules[3].matches[0].headers[0].value}'` — must equal `modelName` | Re-apply the §4.5b patch |
 | **Gateway replica goes stale** (Appendix G §6) | Both pods healthy one evening, ~10% `503` next morning at 25h uptime | Six-call loop; on ClusterIP+Route the 503 does **not** appear in the Envoy log | `oc rollout restart deployment/maas-default-gateway-data-science-gateway-class -n openshift-ingress` |
 | **In-cluster PostgreSQL is emptyDir** | Not observed, but structural | Pod restart | **Every issued analyst API key becomes invalid.** Use RDS or a PVC-backed instance for anything real |
+
+> **Platform changes break inference.** Installing operators, patching the DSCI, or changing the gateway all reverted the HTTPRoute patch, restarted the gateway, or both. **Treat any platform work as a change window that requires re-verifying inference afterwards** — not a background task. Two operator installs during this build each broke the working demo path.
 
 A combined health check, suitable for a CronJob or a monitor:
 
