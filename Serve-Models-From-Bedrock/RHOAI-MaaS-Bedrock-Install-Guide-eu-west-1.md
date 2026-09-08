@@ -58,14 +58,18 @@ Set these in every terminal session used for this guide:
 ```bash
 export AWS_REGION="eu-west-1"
 export MODEL_NS="external-models"                # namespace for external model resources
-export MODEL_NAME="openai.gpt-oss-20b"          # the name clients use AND the Bedrock model ID
-export RESOURCE_NAME="gpt-oss-20b"              # Kubernetes resource name (no dots, for readability)
+export MODEL_NAME="openai.gpt-oss-20b"          # ONE name everywhere: resource names, client-facing name, Bedrock model ID
 export CLUSTER_DOMAIN=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')
 export MAAS_GW="https://maas.${CLUSTER_DOMAIN}"
 echo "Gateway will be: ${MAAS_GW}"
 ```
 
-> **Why the client-facing model name equals the Bedrock model ID.** RHOAI 3.5 generates the gateway route so that it matches requests against the *provider's* model ID, while the request pre-processor populates that match from the *client-facing* model name. When the two values differ, every request returns `404 route_not_found`, and the manual route edit that fixes it is reverted by the operator on reconciliation. Using the same value for both — `openai.gpt-oss-20b` — makes the generated route correct as shipped, with no manual patching and nothing to revert. This guide follows that convention for every model.
+> **Why one name is used everywhere.** Two independent string comparisons in RHOAI 3.5 are satisfied only when the names align:
+>
+> 1. **Routing:** the generated gateway route matches requests against the *provider's* model ID (`targetModel`), while the request pre-processor populates that match from the *client-facing* name (`modelName`). If they differ, every request returns `404 route_not_found`, and the manual route edit that fixes it is reverted by the operator on reconciliation.
+> 2. **Authorization:** the subscription check compares the requested model name against the *model resource name* (`metadata.name`). If they differ, every request is refused with `subscription ... does not include model ...` — even though the subscription references the resource correctly.
+>
+> Setting **`metadata.name` = `modelName` = `targetModel` = `openai.gpt-oss-20b`** satisfies both as shipped, with no manual patching and nothing to revert. Dots are valid in Kubernetes resource names. This guide follows that convention for every model — both failure modes above are verified, not theoretical.
 
 ---
 
@@ -73,30 +77,58 @@ echo "Gateway will be: ${MAAS_GW}"
 
 This part assembles the gateway that will front every model call. Nothing here touches AWS yet.
 
-MaaS may already be partly or fully set up on this cluster. **Start with the assessment in §1.0** — every section that follows opens with the same check, so you only execute the sections whose check fails.
+On a cluster where MaaS is already set up, **do not walk the sections — run the four checks in §1.0.** If they pass, Part 1 is complete. Sections §1.1–§1.7 are the drill-down: use them only to fix whatever a check flags (each opens with its own narrower check, so within a section you also only run what is actually missing).
 
-## 1.0 Check what is already installed
+## 1.0 Verify the platform — four checks
 
-Run this block and note which lines report `MISSING`:
+The verification is top-down: check 1 is an end-to-end probe that transitively proves most of the platform in one call, and checks 2–4 cover only what it cannot see.
 
 ```bash
-printf "%-48s" "RHCL operator (1.1):";                oc get csv -n openshift-operators 2>/dev/null | grep -qi 'rhcl' && echo OK || echo MISSING
-printf "%-48s" "Authorino + Limitador pods (1.2):";   [ "$(oc get pods -n kuadrant-system --no-headers 2>/dev/null | grep -cE 'authorino|limitador')" -ge 2 ] && echo OK || echo MISSING
-printf "%-48s" "Authorino TLS listener (1.2):";       oc logs -n kuadrant-system deployment/authorino 2>/dev/null | head -5 | grep -q '"tls":true' && echo OK || echo "MISSING / VERIFY"
-printf "%-48s" "User workload monitoring (1.3):";     oc get pods -n openshift-user-workload-monitoring --no-headers 2>/dev/null | grep -q prometheus-user-workload && echo OK || echo MISSING
-printf "%-48s" "MaaS gateway (1.4):";                 oc get gateway maas-default-gateway -n openshift-ingress >/dev/null 2>&1 && echo OK || echo MISSING
-printf "%-48s" "Database secret (1.5):";              oc get secret maas-db-config -n redhat-ai-gateway-infra >/dev/null 2>&1 && echo OK || echo MISSING
-printf "%-48s" "MaaS enabled, maas-api running (1.6):"; oc get pods -n redhat-ai-gateway-infra --no-headers 2>/dev/null | grep -q 'maas-api.*Running' && echo OK || echo MISSING
-printf "%-48s" "Gateway health endpoint (1.6):";      [ "$(curl -sk -o /dev/null -w '%{http_code}' ${MAAS_GW}/maas-api/health)" = "200" ] && echo OK || echo MISSING
-printf "%-48s" "Console MaaS flags (1.7):";           [ "$(oc get odhdashboardconfig odh-dashboard-config -n redhat-ods-applications -o jsonpath='{.spec.dashboardConfig.modelAsService}' 2>/dev/null)" = "true" ] && echo OK || echo "MISSING / VERIFY"
+# 1. End-to-end health — proves DNS, the MaaS gateway, its TLS listener,
+#    route admission, the maas-api pod, and its database connection, in one call
+curl -sk "${MAAS_GW}/maas-api/health"; echo
+# {"status":"healthy"}
+
+# 2. Authenticated admin API — proves the auth plane accepts your OpenShift token
+curl -sk "${MAAS_GW}/maas-api/v1/models" -H "Authorization: Bearer $(oc whoami -t)" | jq .
+# valid JSON — {"data":[]} is correct on a cluster with no models yet
+
+# 3. The enforcement/injection components Part 3 depends on (idle until a model exists,
+#    so not exercised by checks 1–2)
+oc get pods -n kuadrant-system
+oc get pods -n openshift-ingress -l app=payload-processing
+# authorino, limitador, payload-processing — all Running
+
+# 4. Authorino TLS — the one configuration that can be broken while 1–3 all pass,
+#    because its failure only surfaces later as certificate errors
+oc logs -n kuadrant-system deployment/authorino | grep -m2 'auth service'   # both lines "tls":true
+oc -n kuadrant-system exec deployment/authorino -- head -1 /etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt   # BEGIN CERTIFICATE
+oc -n kuadrant-system set env deployment/authorino --list | grep -cE 'SSL_CERT|REQUESTS_CA'   # 2
 ```
 
-How to read the result:
+**All four pass → Part 1 is done. Continue with Part 2.**
 
-- **Everything OK** — run the Authorino TLS verification in §1.2 anyway (see the warning below), then jump to the checkpoint in §1.8 and continue with Part 2.
-- **Anything MISSING** — work through only the flagged sections, **in order**. The order matters: the gateway (§1.4) and the database (§1.5) must exist *before* MaaS is enabled (§1.6), or the `maas-api` component crash-loops on startup.
+If a check fails, drill into the matching section:
 
-> ⚠ **Verify the Authorino TLS and certificate configuration (§1.2) even on a cluster where everything reports OK.** It has three parts — the server certificate, the CA bundle mount, and the environment variables — and a missing part fails *silently*: the pods run, the health endpoint answers, and the problem only surfaces later as unrelated-looking certificate errors. The §1.2 checks take under a minute and the configuration commands are safe to re-apply.
+| Check | Symptom | Drill into |
+|---|---|---|
+| 1 | Connection error / cannot resolve host | §1.4 — gateway or DNS |
+| 1 | HTML instead of JSON | Wrong hostname — `MAAS_GW` must be `maas.<cluster-domain>`, not the dashboard host |
+| 1 | `404` | §1.6 — MaaS not enabled |
+| 1 | `503` or not healthy | §1.5 database, then `oc logs -n redhat-ai-gateway-infra deployment/maas-api --tail=100` |
+| 2 | `401`/`403` | Get a fresh token (`oc login`); if it persists, §1.6 |
+| 3 | Pods missing | §1.1–§1.2 for kuadrant-system; §1.6 for the payload processor |
+| 4 | `"tls":false`, or no match | §1.2 — the three-part TLS configuration |
+
+When fixing missing pieces, the build order matters: the gateway (§1.4) and the database (§1.5) must exist *before* MaaS is enabled (§1.6), or `maas-api` crash-loops on startup.
+
+Two items are deliberately **not** in the fast path because nothing in Parts 2–4 functionally depends on them — verify them once, at your convenience:
+
+```bash
+oc get pods -n openshift-user-workload-monitoring   # §1.3 — needed for token-metering dashboards
+oc get odhdashboardconfig odh-dashboard-config -n redhat-ods-applications \
+  -o jsonpath='{.spec.dashboardConfig}'             # §1.7 — needed only for the console UI pages
+```
 
 ## 1.1 Install Red Hat Connectivity Link
 
@@ -204,7 +236,7 @@ oc wait --for=condition=Ready kuadrant/kuadrant -n kuadrant-system --timeout=180
 
 ### Authorino TLS — three parts, all required
 
-**Run this subsection on every installation, including clusters where §1.0 reported everything OK.**
+**If §1.0 check 4 passed (all three probes), this subsection is already satisfied — skip it.**
 
 This is the most error-prone step in Part 1. All three pieces must be present — the server certificate, the CA bundle mount, and the environment variables. A partial configuration fails silently and only surfaces later as unrelated-looking TLS errors.
 
@@ -610,17 +642,7 @@ Then **hard-reload** the RHOAI console (Cmd/Ctrl-Shift-R — the UI caches aggre
 
 ## 1.8 Part 1 checkpoint
 
-Do not continue until all of these pass:
-
-```bash
-oc get pods -n kuadrant-system                             # authorino + limitador Running
-oc get gateway -A                                          # both gateways PROGRAMMED=True
-oc get aitenant -A                                         # READY True
-oc get pods -n redhat-ai-gateway-infra                     # maas-api 1/1 Running
-oc get crd | grep maas.opendatahub.io                      # MaaS CRDs present
-oc get pods -n openshift-ingress -l app=payload-processing # 1/1 Running
-curl -sk "${MAAS_GW}/maas-api/health"; echo                # {"status":"healthy"}
-```
+Re-run the four checks in §1.0 — all green means Part 1 is complete; continue with Part 2. If you created or changed the gateway along the way, restart it first (§1.4(g)) so no replica holds stale configuration.
 
 ---
 
@@ -721,14 +743,15 @@ oc label secret bedrock-api-key -n ${MODEL_NS} \
 >
 > Use plain `oc create secret` as above, not `--dry-run | oc apply` — the apply path writes the key into a `last-applied-configuration` annotation, exposing it in plaintext to anyone with read access to the namespace.
 
-**Confirm the credential watcher picked it up** — this log line must appear within seconds:
+**Confirm the credential watcher picked it up** — the watcher logs the event once, within seconds of the label landing:
 
 ```bash
-oc logs -n openshift-ingress -l app=payload-processing --since=1m | grep -i 'Secret added'
-# "Secret added/updated in store" ... "key":"external-models/bedrock-api-key"
+oc logs -n openshift-ingress -l app=payload-processing --tail=300 | grep -i secret
 ```
 
-If that line is absent, stop and fix it now — nothing downstream will work. Also verify the stored key length:
+The **most recent** event for `external-models/bedrock-api-key` must be `Secret added/updated in store` (a `Secret removed from store` entry is fine as history — e.g. from an earlier key deletion — as long as an add/update follows it).
+
+If no such line exists at all: verify the label with `oc get secret bedrock-api-key -n ${MODEL_NS} --show-labels`, then restart the watcher so it re-lists labeled secrets (`oc rollout restart deployment -n openshift-ingress -l app=payload-processing`) and check the log again. Do not continue until the add/update line is there — nothing downstream will work. Also verify the stored key length:
 
 ```bash
 oc get secret bedrock-api-key -n ${MODEL_NS} -o jsonpath='{.data.api-key}' | base64 -d | wc -c   # 132
@@ -763,14 +786,14 @@ Expect `PHASE: Ready`. Note that `spec.endpoint` is the **hostname only** — no
 
 ## 3.4 ExternalModel
 
-This maps the client-facing model name to the provider's model ID. Per the naming convention explained at the top of this guide, **both are `openai.gpt-oss-20b`**:
+This maps the client-facing model name to the provider's model ID. Per the naming convention explained at the top of this guide, **the resource name, `modelName`, and `targetModel` are all `openai.gpt-oss-20b`**:
 
 ```bash
 cat <<EOF | oc apply -f -
 apiVersion: inference.opendatahub.io/v1alpha1
 kind: ExternalModel
 metadata:
-  name: ${RESOURCE_NAME}
+  name: ${MODEL_NAME}
   namespace: ${MODEL_NS}
 spec:
   modelName: ${MODEL_NAME}
@@ -788,9 +811,9 @@ oc get externalmodels.inference.opendatahub.io -n ${MODEL_NS}
 
 | Field | Meaning |
 |---|---|
-| `metadata.name` | Kubernetes resource name (dots avoided for readability) |
+| `metadata.name` | Resource name — the authorization layer matches the requested model against it, so it must equal `modelName` |
 | `modelName` | The name clients put in the request body |
-| `targetModel` | Bedrock's model ID — **identical to `modelName` by design** |
+| `targetModel` | Bedrock's model ID — the generated route matches against it, so it must also equal `modelName` |
 | `apiFormat` / `path` | `openai-chat` on `/v1/chat/completions` — the OpenAI-compatible API |
 
 > Two CRD groups share the short name `externalmodels`; always use the fully-qualified `externalmodels.inference.opendatahub.io` in commands.
@@ -798,7 +821,7 @@ oc get externalmodels.inference.opendatahub.io -n ${MODEL_NS}
 **Verify the generated route attached and matches correctly:**
 
 ```bash
-oc get httproute ${RESOURCE_NAME} -n ${MODEL_NS} \
+oc get httproute ${MODEL_NAME} -n ${MODEL_NS} \
   -o jsonpath='{range .status.parents[*].conditions[*]}{.type}={.status}{"\n"}{end}'
 ```
 
@@ -816,7 +839,7 @@ kuadrant.io/TokenRateLimitPolicyAffected=True
 Now confirm the route's model-name match — this is where the naming convention pays off:
 
 ```bash
-oc get httproute ${RESOURCE_NAME} -n ${MODEL_NS} -o jsonpath='{.spec.rules}' \
+oc get httproute ${MODEL_NAME} -n ${MODEL_NS} -o jsonpath='{.spec.rules}' \
   | python3 -m json.tool | grep -A2 'X-Gateway-Model-Name'
 ```
 
@@ -829,12 +852,12 @@ cat <<EOF | oc apply -f -
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: MaaSModelRef
 metadata:
-  name: ${RESOURCE_NAME}
+  name: ${MODEL_NAME}
   namespace: ${MODEL_NS}
 spec:
   modelRef:
     kind: ExternalModel
-    name: ${RESOURCE_NAME}
+    name: ${MODEL_NAME}
 EOF
 
 oc get maasmodelref -n ${MODEL_NS}
@@ -843,7 +866,7 @@ oc get maasmodelref -n ${MODEL_NS}
 **Expect `PHASE: Pending` with an empty ENDPOINT — that is correct at this point.** Look at why:
 
 ```bash
-oc describe maasmodelref ${RESOURCE_NAME} -n ${MODEL_NS} | grep -A4 Conditions
+oc describe maasmodelref ${MODEL_NAME} -n ${MODEL_NS} | grep -A4 Conditions
 ```
 
 ```
@@ -880,7 +903,7 @@ metadata:
   namespace: models-as-a-service
 spec:
   modelRefs:
-    - name: ${RESOURCE_NAME}
+    - name: ${MODEL_NAME}
       namespace: ${MODEL_NS}
   subjects:
     groups:
@@ -903,7 +926,7 @@ spec:
     costCenter: "platform"
     organizationId: "default"
   modelRefs:
-    - name: ${RESOURCE_NAME}
+    - name: ${MODEL_NAME}
       namespace: ${MODEL_NS}
       tokenRateLimits:
         - limit: 100000
@@ -1017,17 +1040,27 @@ curl -sk -o /dev/null -w "unknown model: %{http_code}\n" "${MAAS_GW}/v1/chat/com
 # expect 404 — or code 000 (empty reply) on some gateway versions; either way, refused
 ```
 
-There is a fourth, more meaningful refusal — `403` with the header `x-ext-auth-reason: model_not_in_subscription` — returned when the requested model **is registered on the gateway but not covered by the caller's subscription**. It cannot be demonstrated with a single registered model; once a second model is registered (see "Adding more models later") and added to only one subscription, a valid key from the other subscription requesting it receives exactly that response:
+There is a fourth, more meaningful refusal — `403` with the header `x-ext-auth-reason: model_not_in_subscription` — returned when the requested model **is registered on the gateway but not covered by the caller's subscription**. Note what does *not* trigger it: the gateway has no knowledge of which models exist on Bedrock, so a real-but-unregistered Bedrock model ID behaves exactly like a fake name (the unroutable case above). The refusal requires the name to resolve to a registered model.
+
+To demonstrate it, register a second real model — `openai.gpt-oss-120b` works well — and pair it with a **separate** subscription: follow "Adding more models later" with `M2_ID="openai.gpt-oss-120b"`, but in step 3 add the model to the auth policy and to a *new* subscription (e.g. `premium`, same shape as §3.6's) instead of the standard one. Then the same model gives opposite results for two valid keys:
 
 ```bash
+# A standard-subscription key → refused, with a machine-readable reason
 curl -sk -D- -o /dev/null "${MAAS_GW}/v1/chat/completions" \
   -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" \
-  -d '{"model":"<registered-model-not-in-this-subscription>","messages":[{"role":"user","content":"hi"}],"max_tokens":50}' \
-  | grep -i 'x-ext-auth-reason'
+  -d '{"model":"openai.gpt-oss-120b","messages":[{"role":"user","content":"hi"}],"max_tokens":300}' \
+  | grep -iE '^HTTP|x-ext-auth-reason'
+# HTTP/... 403
 # x-ext-auth-reason: model_not_in_subscription
+
+# A premium-subscription key → answered
+curl -sk -m 120 "${MAAS_GW}/v1/chat/completions" \
+  -H "Authorization: Bearer ${PREMIUM_KEY}" -H "Content-Type: application/json" \
+  -d '{"model":"openai.gpt-oss-120b","messages":[{"role":"user","content":"hi"}],"max_tokens":300}' \
+  | jq -r '.choices[0].message.content'
 ```
 
-That one is worth showing: a valid key is not a licence to use any model — access is scoped per subscription.
+That contrast is worth showing: a valid key is not a licence to use any model — access is scoped per subscription, and the refusal names the reason.
 
 ## 4.6 Demonstrate the token quota (optional)
 
@@ -1051,7 +1084,7 @@ spec:
     costCenter: "demo-limited"
     organizationId: "default"
   modelRefs:
-    - name: ${RESOURCE_NAME}
+    - name: ${MODEL_NAME}
       namespace: ${MODEL_NS}
       tokenRateLimits:
         - limit: 100
@@ -1062,28 +1095,31 @@ sleep 20
 oc get maassubscription -n models-as-a-service     # both Active
 ```
 
-Mint one key per subscription (`SUBSCRIPTION` is the standard subscription's name from §4.2):
+Mint one key per subscription. In the request body, `name` is only a display label for the key itself — `subscription` is the field that decides which quota the key draws from (`SUBSCRIPTION` is the standard subscription's name from §4.2, e.g. `users-standard`):
 
 ```bash
 KEY_STD=$(curl -sk -X POST "${MAAS_GW}/maas-api/v1/api-keys" \
   -H "Authorization: Bearer $(oc whoami -t)" -H "Content-Type: application/json" \
-  -d "{\"name\":\"demo-standard\",\"subscription\":\"${SUBSCRIPTION}\",\"expiresIn\":\"24h\"}" | jq -r '.key')
+  -d "{\"name\":\"quota-demo-key-1\",\"subscription\":\"${SUBSCRIPTION}\",\"expiresIn\":\"24h\"}" | jq -r '.key')
 
 KEY_LIM=$(curl -sk -X POST "${MAAS_GW}/maas-api/v1/api-keys" \
   -H "Authorization: Bearer $(oc whoami -t)" -H "Content-Type: application/json" \
-  -d '{"name":"demo-limited","subscription":"demo-limited","expiresIn":"24h"}' | jq -r '.key')
+  -d '{"name":"quota-demo-key-2","subscription":"demo-limited","expiresIn":"24h"}' | jq -r '.key')
 
 echo "std=${KEY_STD:0:12}... lim=${KEY_LIM:0:12}..."
 ```
 
+Both echoes must show a `sk-`-prefixed value — `null` means that mint failed (usually a `subscription` value that does not match an Active `MaaSSubscription`; see the note in §4.2).
+
 Run the comparison — three calls on each key:
 
 ```bash
-for KEYNAME in KEY_STD KEY_LIM; do
-  echo "--- ${KEYNAME} ---"
+# first pass = KEY_STD (standard subscription), second pass = KEY_LIM (limited)
+for KEY in "$KEY_STD" "$KEY_LIM"; do
+  echo "--- key ${KEY:0:12}... ---"
   for i in 1 2 3; do
     curl -sk -o /dev/null -w "call $i: %{http_code}\n" -m 60 \
-      "${MAAS_GW}/v1/chat/completions" -H "Authorization: Bearer ${!KEYNAME}" \
+      "${MAAS_GW}/v1/chat/completions" -H "Authorization: Bearer ${KEY}" \
       -H "Content-Type: application/json" \
       -d "{\"model\":\"${MODEL_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":300}"
     sleep 2
@@ -1094,11 +1130,11 @@ done
 Expected result:
 
 ```
---- KEY_STD ---
+--- key sk-... (standard) ---
 call 1: 200
 call 2: 200
 call 3: 200
---- KEY_LIM ---
+--- key sk-... (limited) ---
 call 1: 200
 call 2: 429
 call 3: 429
@@ -1122,11 +1158,10 @@ oc delete maassubscription demo-limited -n models-as-a-service
 
 # Adding more models later
 
-No new AWS credential and no new provider — the existing `ExternalProvider` is reused. **Keep the naming convention: the client-facing `modelName` must equal the Bedrock model ID (`targetModel`).**
+No new AWS credential and no new provider — the existing `ExternalProvider` is reused. **Keep the naming convention: one string for the resource names, the client-facing `modelName`, and the Bedrock model ID (`targetModel`).**
 
 ```bash
-export M2_ID="mistral.mistral-large-3-675b-instruct"    # Bedrock model ID = client-facing name
-export M2_RES="mistral-large-3"                          # Kubernetes resource name
+export M2_ID="mistral.mistral-large-3-675b-instruct"    # one name: resources, client-facing, Bedrock ID
 
 # 1. Test the model against Bedrock directly FIRST
 curl -s "https://bedrock-mantle.${AWS_REGION}.api.aws/v1/chat/completions" \
@@ -1139,7 +1174,7 @@ cat <<EOF | oc apply -f -
 apiVersion: inference.opendatahub.io/v1alpha1
 kind: ExternalModel
 metadata:
-  name: ${M2_RES}
+  name: ${M2_ID}
   namespace: ${MODEL_NS}
 spec:
   modelName: ${M2_ID}
@@ -1154,20 +1189,20 @@ spec:
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: MaaSModelRef
 metadata:
-  name: ${M2_RES}
+  name: ${M2_ID}
   namespace: ${MODEL_NS}
 spec:
   modelRef:
     kind: ExternalModel
-    name: ${M2_RES}
+    name: ${M2_ID}
 EOF
 
 # 3. Attach governance — without this the model stays Pending
 oc patch maasauthpolicy bedrock-access -n models-as-a-service --type=json \
-  -p "[{\"op\":\"add\",\"path\":\"/spec/modelRefs/-\",\"value\":{\"name\":\"${M2_RES}\",\"namespace\":\"${MODEL_NS}\"}}]"
+  -p "[{\"op\":\"add\",\"path\":\"/spec/modelRefs/-\",\"value\":{\"name\":\"${M2_ID}\",\"namespace\":\"${MODEL_NS}\"}}]"
 
 oc patch maassubscription users-standard -n models-as-a-service --type=json \
-  -p "[{\"op\":\"add\",\"path\":\"/spec/modelRefs/-\",\"value\":{\"name\":\"${M2_RES}\",\"namespace\":\"${MODEL_NS}\",\"tokenRateLimits\":[{\"limit\":100000,\"window\":\"1h\"}]}}]"
+  -p "[{\"op\":\"add\",\"path\":\"/spec/modelRefs/-\",\"value\":{\"name\":\"${M2_ID}\",\"namespace\":\"${MODEL_NS}\",\"tokenRateLimits\":[{\"limit\":100000,\"window\":\"1h\"}]}}]"
 
 # 4. Verify
 sleep 20
@@ -1193,6 +1228,7 @@ Work through the request path in order. First identify **where** the failure hap
 | `404` **with an `x-amzn-requestid` header** | AWS — wrong path | Call the gateway root, not a namespaced path (§4.3) |
 | `400 ... does not support the '/v1/chat/completions' API` | AWS — wrong API format | Use an OpenAI-format model |
 | `403` with `x-ext-auth-reason: model_not_in_subscription` | Authorization, working correctly | The requested model is not in the caller's subscription |
+| `subscription ... does not include model ...` for a model the subscription **does** reference | Authorization — name mismatch | The model resources are named differently from the client-facing name; `metadata.name` must equal `modelName` (§3.4), and the subscription's `modelRefs` must use that name |
 | `401` on a previously working key | The MaaS API key expired | Mint a new one (§4.2) |
 | `503` on a fraction of calls | Stale gateway replica | Restart the gateway (§4.4) |
 | `MaaSModelRef` Pending, `NoPairingFound` | Governance missing | §3.6 |
@@ -1217,6 +1253,6 @@ The payload-processing log names each stage: `maas-headers-guard` → `model-pro
 - **The AWS Bedrock key expires** per its configured lifetime (typically 90 days). An IAM user can hold two keys at once: create the new key, update the `bedrock-api-key` Secret, confirm the payload-processing log shows `Secret added/updated`, then delete the old key — zero-downtime rotation.
 - **MaaS API keys expire** per their `expiresIn` at creation. An expired key returns `401`, which looks like an auth fault rather than an expiry — check key age first.
 - **After any gateway, Service, or operator change**, restart the MaaS gateway deployment and re-run the six-call stability loop (§4.4).
-- **When adding models**, always keep `modelName` equal to the Bedrock model ID — the naming convention this installation relies on (see the note in the Prerequisites section).
+- **When adding models**, always use one string for the resource names, `modelName`, and the Bedrock model ID — the naming convention this installation relies on (see the note in the Prerequisites section).
 - **Database durability:** if the quick in-cluster PostgreSQL from §1.5 is still in use, plan the move to a managed/PVC-backed instance — a database restart invalidates every issued MaaS API key.
 - **IAM scope:** review the policy attached to the Bedrock key's IAM user. `AmazonBedrockLimitedAccess` grants more than a gateway needs (model customization, guardrail deletion, marketplace subscription); `AmazonBedrockMantleInferenceAccess` is the narrower alternative. Whichever is used must include `bedrock-mantle:CallWithBearerToken`.

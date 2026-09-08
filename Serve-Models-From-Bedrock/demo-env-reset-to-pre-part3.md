@@ -52,11 +52,35 @@ oc get guardrailsorchestrator -A 2>/dev/null
 
 ---
 
-## Step 1 — Revoke minted MaaS API keys
+## Step 1 — Revoke all minted MaaS API keys
 
-Deleting the subscriptions (Step 2) invalidates every key bound to them, so this step is belt-and-braces — but do it anyway to keep the key store clean: **Gen AI studio → API keys** → delete `install-verify`, `demo-standard`, `demo-limited`, **`nemo-guardrails`**, and anything else listed.
+This `maas-api` build exposes key *creation* over REST (`POST /maas-api/v1/api-keys`) but no list or revoke endpoints — `GET`/`DELETE` on that path family all return 404 (verified). The console (**Gen AI studio → API keys**) is the only official revocation surface. On the demo env, go straight to the store instead: keys live in the `api_keys` table of the PostgreSQL you deployed in `maas-db`.
 
-The `nemo-guardrails` key matters most: unlike the 24-hour test keys, it was minted with `expiresIn: 720h`, so it does not die of old age any time soon.
+```bash
+# Inspect what will be removed (key values are stored hashed — this exposes no secrets)
+oc exec -n maas-db deployment/maas-postgres -- psql -U maas -d maas \
+  -c 'SELECT name, username, subscription, status, expires_at FROM api_keys;'
+
+# Wipe every issued key
+oc exec -n maas-db deployment/maas-postgres -- psql -U maas -d maas -c 'DELETE FROM api_keys;'
+
+# Restart maas-api to drop any cached key state
+oc rollout restart deployment/maas-api -n redhat-ai-gateway-infra
+oc rollout status deployment/maas-api -n redhat-ai-gateway-infra --timeout=180s
+```
+
+Verify: any previously working key must now be refused.
+
+```bash
+curl -sk -o /dev/null -w "revoked key: %{http_code}\n" "${MAAS_GW}/v1/chat/completions" \
+  -H "Authorization: Bearer <an-old-key>" -H "Content-Type: application/json" \
+  -d '{"model":"openai.gpt-oss-20b","messages":[{"role":"user","content":"hi"}],"max_tokens":50}'
+# expect 401 or 403
+```
+
+> Strictly, this step is belt-and-braces: deleting the subscriptions (Step 2) invalidates every key bound to them, and the demo keys all expire within 24 hours anyway. The value of the wipe is a clean store — no stale rows and no name collisions when the same key names are re-minted on the next practice round.
+>
+> **Demo env only.** On a customer cluster, keys are revoked through the console; do not reach into the database of a system you did not deploy.
 
 ---
 
@@ -102,8 +126,9 @@ If an HTTPRoute lingers after a minute, it has a stuck finalizer — check `oc g
 ```bash
 oc delete secret bedrock-api-key -n ${MODEL_NS}
 
-# The credential watcher should log the removal within seconds
-oc logs -n openshift-ingress -l app=payload-processing --since=1m | grep -i secret
+# The credential watcher logs the removal within seconds — the most recent event
+# for external-models/bedrock-api-key must be "Secret removed from store"
+oc logs -n openshift-ingress -l app=payload-processing --tail=300 | grep -i secret
 ```
 
 Then remove the namespace itself — the customer cluster does not have it; the install guide's §3.1 creates it:
@@ -127,7 +152,7 @@ The customer install has no guardrails; the demo env does. Everything guardrails
 |---|---|
 | `NemoGuardrails/nemo-guardrails` CR | You (runbook §5.4) — its pod, Service, and reencrypt Route are operator-created and go with it |
 | ConfigMaps `nemo-config`, `nemo-ca-bundle` | You (§5.3) |
-| Secret `nemo-upstream-key` | You (§5.2) — holds the 720h MaaS key revoked in Step 1 |
+| Secret `nemo-upstream-key` | You (§5.2) — holds a MaaS key already wiped in Step 1 |
 | Namespace label `maas.opendatahub.io/gateway-access` | You (§5.2) |
 
 ```bash
@@ -160,17 +185,21 @@ oc get group 2>/dev/null | grep -i nemo
 
 ## Step 6 — Verify the end state matches the customer cluster
 
-The platform must still be fully healthy — this is the §1.0 assessment from the install guide, and every line must be OK:
+The platform must still be fully healthy — this is the four-check fast path from the install guide's §1.0:
 
 ```bash
-printf "%-48s" "RHCL operator:";                oc get csv -n openshift-operators 2>/dev/null | grep -qi 'rhcl' && echo OK || echo MISSING
-printf "%-48s" "Authorino + Limitador pods:";   [ "$(oc get pods -n kuadrant-system --no-headers 2>/dev/null | grep -cE 'authorino|limitador')" -ge 2 ] && echo OK || echo MISSING
-printf "%-48s" "Authorino TLS listener:";       oc logs -n kuadrant-system deployment/authorino 2>/dev/null | head -5 | grep -q '"tls":true' && echo OK || echo MISSING
-printf "%-48s" "User workload monitoring:";     oc get pods -n openshift-user-workload-monitoring --no-headers 2>/dev/null | grep -q prometheus-user-workload && echo OK || echo MISSING
-printf "%-48s" "MaaS gateway:";                 oc get gateway maas-default-gateway -n openshift-ingress >/dev/null 2>&1 && echo OK || echo MISSING
-printf "%-48s" "Database secret:";              oc get secret maas-db-config -n redhat-ai-gateway-infra >/dev/null 2>&1 && echo OK || echo MISSING
-printf "%-48s" "maas-api running:";             oc get pods -n redhat-ai-gateway-infra --no-headers 2>/dev/null | grep -q 'maas-api.*Running' && echo OK || echo MISSING
-printf "%-48s" "Gateway health endpoint:";      [ "$(curl -sk -o /dev/null -w '%{http_code}' ${MAAS_GW}/maas-api/health)" = "200" ] && echo OK || echo MISSING
+# 1. End-to-end health (gateway, routing, maas-api, database)
+curl -sk "${MAAS_GW}/maas-api/health"; echo                # {"status":"healthy"}
+
+# 2. Authenticated admin API
+curl -sk "${MAAS_GW}/maas-api/v1/models" -H "Authorization: Bearer $(oc whoami -t)" | jq .
+
+# 3. Enforcement/injection pods
+oc get pods -n kuadrant-system
+oc get pods -n openshift-ingress -l app=payload-processing
+
+# 4. Authorino TLS
+oc logs -n kuadrant-system deployment/authorino | grep -m2 'auth service'   # both "tls":true
 ```
 
 And the model layer must be empty:
