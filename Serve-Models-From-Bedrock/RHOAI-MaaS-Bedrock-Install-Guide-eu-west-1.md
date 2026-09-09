@@ -1042,25 +1042,110 @@ curl -sk -o /dev/null -w "unknown model: %{http_code}\n" "${MAAS_GW}/v1/chat/com
 
 There is a fourth, more meaningful refusal — `403` with the header `x-ext-auth-reason: model_not_in_subscription` — returned when the requested model **is registered on the gateway but not covered by the caller's subscription**. Note what does *not* trigger it: the gateway has no knowledge of which models exist on Bedrock, so a real-but-unregistered Bedrock model ID behaves exactly like a fake name (the unroutable case above). The refusal requires the name to resolve to a registered model.
 
-To demonstrate it, register a second real model — `openai.gpt-oss-120b` works well — and pair it with a **separate** subscription: follow "Adding more models later" with `M2_ID="openai.gpt-oss-120b"`, but in step 3 add the model to the auth policy and to a *new* subscription (e.g. `premium`, same shape as §3.6's) instead of the standard one. Then the same model gives opposite results for two valid keys:
+To demonstrate it, register a second real model and pair it with a **separate** subscription. The setup below is self-contained; `openai.gpt-oss-120b` is used as the second model.
 
 ```bash
-# A standard-subscription key → refused, with a machine-readable reason
+export M2="openai.gpt-oss-120b"
+
+# (a) Register the model on the gateway — same one-name convention as §3.4
+cat <<EOF | oc apply -f -
+apiVersion: inference.opendatahub.io/v1alpha1
+kind: ExternalModel
+metadata:
+  name: ${M2}
+  namespace: ${MODEL_NS}
+spec:
+  modelName: ${M2}
+  externalProviderRefs:
+    - ref:
+        name: bedrock-${AWS_REGION}
+      apiFormat: openai-chat
+      path: /v1/chat/completions
+      targetModel: ${M2}
+      weight: 100
+---
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSModelRef
+metadata:
+  name: ${M2}
+  namespace: ${MODEL_NS}
+spec:
+  modelRef:
+    kind: ExternalModel
+    name: ${M2}
+EOF
+
+# (b) Allow it in the auth policy — deliberately NOT in the standard subscription
+oc patch maasauthpolicy bedrock-access -n models-as-a-service --type=json \
+  -p "[{\"op\":\"add\",\"path\":\"/spec/modelRefs/-\",\"value\":{\"name\":\"${M2}\",\"namespace\":\"${MODEL_NS}\"}}]"
+
+# (c) Pair it with its own subscription
+cat <<EOF | oc apply -f -
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSSubscription
+metadata:
+  name: premium
+  namespace: models-as-a-service
+spec:
+  owner:
+    groups:
+      - name: "system:authenticated"
+  priority: 60
+  tokenMetadata:
+    costCenter: "premium"
+    organizationId: "default"
+  modelRefs:
+    - name: ${M2}
+      namespace: ${MODEL_NS}
+      tokenRateLimits:
+        - limit: 100000
+          window: "1h"
+EOF
+
+# (d) Verify both gates BEFORE testing — do not continue until both pass
+sleep 20
+oc get maassubscription premium -n models-as-a-service   # PHASE Active
+oc get maasmodelref -n ${MODEL_NS}                       # openai.gpt-oss-120b Ready
+
+# (e) Mint a key on the premium subscription — the echo must print sk-..., not null
+PREMIUM_KEY=$(curl -sk -X POST "${MAAS_GW}/maas-api/v1/api-keys" \
+  -H "Authorization: Bearer $(oc whoami -t)" -H "Content-Type: application/json" \
+  -d '{"name":"premium-verify","subscription":"premium","expiresIn":"24h"}' | jq -r '.key')
+echo "PREMIUM_KEY=${PREMIUM_KEY:0:12}..."
+```
+
+`API_KEY` and `PREMIUM_KEY` are the same kind of credential, minted by the same call — the only difference is the `subscription` each is bound to, and the subscription is what defines both the model list and the token quota. Now the same model gives opposite results for the two keys:
+
+```bash
+# The standard-subscription key → refused, with a machine-readable reason
 curl -sk -D- -o /dev/null "${MAAS_GW}/v1/chat/completions" \
   -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" \
-  -d '{"model":"openai.gpt-oss-120b","messages":[{"role":"user","content":"hi"}],"max_tokens":300}' \
+  -d "{\"model\":\"${M2}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":300}" \
   | grep -iE '^HTTP|x-ext-auth-reason'
-# HTTP/... 403
+# HTTP/2 403
 # x-ext-auth-reason: model_not_in_subscription
 
-# A premium-subscription key → answered
+# The premium-subscription key → answered
 curl -sk -m 120 "${MAAS_GW}/v1/chat/completions" \
   -H "Authorization: Bearer ${PREMIUM_KEY}" -H "Content-Type: application/json" \
-  -d '{"model":"openai.gpt-oss-120b","messages":[{"role":"user","content":"hi"}],"max_tokens":300}' \
+  -d "{\"model\":\"${M2}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":300}" \
   | jq -r '.choices[0].message.content'
 ```
 
-That contrast is worth showing: a valid key is not a licence to use any model — access is scoped per subscription, and the refusal names the reason.
+That contrast is worth showing: a valid key is not a licence to use any model — access is scoped per subscription, and the refusal names the reason. Note the failure mode if (a)–(c) are skipped: the standard key gets a plain `404`, not the 403 — an unregistered name never reaches the subscription check.
+
+### Response codes at a glance
+
+Every governance outcome has a distinct signature — in short: **401** who are you, **403** you may not, **404** no such model here, **429** budget spent.
+
+| Code | Meaning | Distinguishing mark |
+|---|---|---|
+| `401` | No credential presented | — |
+| `403` | Forged or invalid key | Rejected at authentication; no reason header for the model |
+| `403` + `x-ext-auth-reason: model_not_in_subscription` | Valid key; model registered but outside the key's subscription | The header names the reason — use `curl -D-` to show it |
+| `404` | Model name not registered on the gateway (fake **or** real-on-Bedrock) | Request is never routed. If the 404 instead carries an `x-amzn-requestid` header, the request *did* reach AWS and the URL path is wrong (§4.3) |
+| `429` | Valid key, model in subscription, token quota exhausted | Clears when the rate-limit window resets (§4.6) |
+| `503` (intermittent) | Stale gateway replica, not a governance outcome | Restart the gateway and re-run the stability loop (§4.4) |
 
 ## 4.6 Demonstrate the token quota (optional)
 
